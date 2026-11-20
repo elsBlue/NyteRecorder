@@ -66,6 +66,7 @@ class RecorderService : Service() {
         }
         val projection: MediaProjection = try {
             getSystemService(MediaProjectionManager::class.java).getMediaProjection(code, data)
+                ?: run { fail("Screen capture unavailable."); return }
         } catch (e: Exception) {
             fail("Could not start screen capture: ${e.message}")
             return
