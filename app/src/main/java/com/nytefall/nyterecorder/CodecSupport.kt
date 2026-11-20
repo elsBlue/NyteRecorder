@@ -134,4 +134,41 @@ object CodecSupport {
         }
         return Plan(info?.name, codec.mime, chosen.first, chosen.second, nd.dpi, fps, bitrate, notes, rateAt(chosen.first, chosen.second), a, forced)
     }
+
+    // ---------------------------------------------------------------- diagnostics
+
+    fun listEncoders(mime: String): List<String> =
+        MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos.filter { i -> i.isEncoder && i.supportedTypes.any { it.equals(mime, true) } }
+            .map { i ->
+                "${i.name} hw=${if (Build.VERSION.SDK_INT >= 29) i.isHardwareAccelerated else "?"} " +
+                    "swOnly=${if (Build.VERSION.SDK_INT >= 29) i.isSoftwareOnly else "?"} " +
+                    "alias=${if (Build.VERSION.SDK_INT >= 29) i.isAlias else "?"}"
+            }
+
+    /** Human-readable capability dump of an encoder for [mime], with rates checked at [w]x[h]. */
+    fun describe(info: MediaCodecInfo, mime: String, w: Int, h: Int): List<String> {
+        val out = ArrayList<String>()
+        out += "Encoder: ${info.name}" + if (Build.VERSION.SDK_INT >= 29) " (canonical ${info.canonicalName}, hw=${info.isHardwareAccelerated}, softwareOnly=${info.isSoftwareOnly}, vendor=${info.isVendor})" else ""
+        val c = try { info.getCapabilitiesForType(mime) } catch (e: Exception) { out += "  capabilities unavailable: $e"; return out }
+        val v = c.videoCapabilities
+        if (v != null) {
+            out += "  widths=${v.supportedWidths} heights=${v.supportedHeights} alignment=${v.widthAlignment}x${v.heightAlignment}"
+            out += "  supportedFrameRates(any size)=${v.supportedFrameRates}"
+            out += "  supportedFrameRatesFor(${w}x$h)=${runCatching { v.getSupportedFrameRatesFor(w, h) }.getOrElse { "n/a ($it)" }}"
+            out += "  achievableFrameRatesFor(${w}x$h)=${runCatching { v.getAchievableFrameRatesFor(w, h) }.getOrNull() ?: "n/a"}"
+            out += "  isSizeSupported=${v.isSizeSupported(w, h)} areSizeAndRateSupported(60)=${v.areSizeAndRateSupported(w, h, 60.0)} (30)=${v.areSizeAndRateSupported(w, h, 30.0)}"
+            out += "  bitrateRange=${v.bitrateRange}"
+            if (Build.VERSION.SDK_INT >= 29) out += "  performancePoints=${v.supportedPerformancePoints?.joinToString("; ") ?: "none"}"
+        }
+        out += "  maxSupportedInstances=${c.maxSupportedInstances}"
+        c.encoderCapabilities?.let { e ->
+            out += "  bitrateModes: VBR=${e.isBitrateModeSupported(MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR)} " +
+                "CBR=${e.isBitrateModeSupported(MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR)} " +
+                "CQ=${e.isBitrateModeSupported(MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CQ)}; complexity=${e.complexityRange} quality=${e.qualityRange}"
+        }
+        out += "  profiles/levels: " + c.profileLevels.joinToString(", ") { "p=0x${Integer.toHexString(it.profile)}/l=0x${Integer.toHexString(it.level)}" }
+        out += "  surface input colour format: ${c.colorFormats.contains(MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)}"
+        if (Build.VERSION.SDK_INT >= 30) out += "  feature low-latency=${c.isFeatureSupported(MediaCodecInfo.CodecCapabilities.FEATURE_LowLatency)}"
+        return out
+    }
 }

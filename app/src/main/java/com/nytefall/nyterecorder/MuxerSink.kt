@@ -21,6 +21,10 @@ class MuxerSink(private val muxer: MediaMuxer, private var expectedTracks: Int) 
     private var added = 0
     var wroteSamples = false
         private set
+    // Diagnostics: raw (monotonic) pts of the first sample per track, and the rebase origin.
+    val firstRawPts = LongArray(2) { Long.MIN_VALUE }
+    val sampleCount = IntArray(2)
+    val rebaseBase get() = base
 
     @Synchronized
     fun addTrack(kind: Int, format: MediaFormat) {
@@ -43,6 +47,8 @@ class MuxerSink(private val muxer: MediaMuxer, private var expectedTracks: Int) 
 
     @Synchronized
     fun write(kind: Int, buf: ByteBuffer, offset: Int, size: Int, ptsUs: Long, flags: Int) {
+        if (firstRawPts[kind] == Long.MIN_VALUE) firstRawPts[kind] = ptsUs
+        sampleCount[kind]++
         if (started) {
             if (trackIds[kind] < 0) return
             writeNow(kind, buf, offset, ptsUs, flags, size, MediaCodec.BufferInfo())

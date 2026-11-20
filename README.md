@@ -19,6 +19,13 @@ Other options: Native 2408x1080, 720p, 30 fps, 8/16 Mbps, H.265 (only if a hardw
 ## Output
 `Movies/NyteRecorder/NyteRec_yyyyMMdd_HHmmss.mp4`. Stop from the notification, the app, or the optional bubble.
 
+## Diagnostic log
+Every recording also writes `NyteRec_<timestamp>.log.txt` to `Documents/NyteRecorder/logs` (visible in the Files app; use
+"Share log" on a recent recording). It is built in memory (per-second aggregates) and written once at the end, so there is no disk
+I/O while recording. It contains device/app info, settings, encoder capabilities, the MediaFormat actually applied and any
+retries, rotation events, frame/audio stats, A/V start offsets, thermal and battery temperature, and a read-back verification
+of the saved file (size, fps, bitrate vs. what was selected).
+
 ## Known limitations
 - Apps that opt out of capture (`allowAudioPlaybackCapture=false`) or use `USAGE` types outside media/game/unknown are silent.
 - The optional bubble and the notification shade are visible in the video (they are part of the screen).

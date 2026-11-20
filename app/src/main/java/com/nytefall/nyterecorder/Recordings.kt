@@ -30,10 +30,26 @@ object Recordings {
         return out
     }
 
-    fun delete(ctx: Context, r: Rec): Boolean = try {
-        ctx.contentResolver.delete(r.uri, null, null) > 0
-    } catch (e: SecurityException) {
-        false
+    fun delete(ctx: Context, r: Rec): Boolean {
+        val ok = try {
+            ctx.contentResolver.delete(r.uri, null, null) > 0
+        } catch (e: SecurityException) {
+            false
+        }
+        if (ok) { // the matching diagnostic log goes with it (best effort)
+            runCatching { RecLog.find(ctx, r.name.removeSuffix(".mp4"))?.let { ctx.contentResolver.delete(it, null, null) } }
+        }
+        return ok
+    }
+
+    /** Shares the diagnostic log that belongs to this recording. */
+    fun shareLog(ctx: Context, r: Rec): Boolean {
+        val u = RecLog.find(ctx, r.name.removeSuffix(".mp4")) ?: return false
+        val i = Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_STREAM, u)
+            .putExtra(Intent.EXTRA_SUBJECT, r.name.removeSuffix(".mp4") + " log")
+            .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        runCatching { ctx.startActivity(Intent.createChooser(i, "Share log").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) }
+        return true
     }
 
     fun play(ctx: Context, r: Rec) {

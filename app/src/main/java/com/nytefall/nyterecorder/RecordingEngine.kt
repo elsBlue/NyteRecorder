@@ -4,7 +4,6 @@ import android.content.ContentValues
 import android.content.Context
 import android.content.pm.PackageManager
 import android.hardware.display.DisplayManager
-import android.view.Display
 import android.hardware.display.VirtualDisplay
 import android.media.AudioAttributes
 import android.media.AudioFormat
@@ -13,7 +12,9 @@ import android.media.AudioRecord
 import android.media.AudioTimestamp
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
+import android.media.MediaExtractor
 import android.media.MediaFormat
+import android.media.MediaMetadataRetriever
 import android.media.MediaMuxer
 import android.media.MediaRecorder
 import android.media.projection.MediaProjection
@@ -21,9 +22,12 @@ import android.net.Uri
 import android.os.Handler
 import android.os.Looper
 import android.os.ParcelFileDescriptor
+import android.os.PowerManager
 import android.os.Process
+import android.os.SystemClock
 import android.provider.MediaStore
 import android.util.Log
+import android.view.Display
 import android.view.Surface
 import androidx.core.content.ContextCompat
 import java.nio.ByteBuffer
@@ -38,6 +42,7 @@ import kotlin.math.max
 /**
  * Screen -> VirtualDisplay -> encoder input Surface (zero CPU copies) -> MediaMuxer, plus an AAC audio
  * path fed by AudioPlaybackCapture (and optionally the mic). Everything runs on its own threads.
+ * A diagnostic log is kept in memory (aggregated per second) and written once at the end.
  */
 class RecordingEngine(
     private val ctx: Context,
@@ -54,6 +59,43 @@ class RecordingEngine(
         private const val FRAME_SAMPLES = 1024 // one AAC frame
         private const val CHUNK_BYTES = FRAME_SAMPLES * 4 // 16-bit stereo
     }
+
+    // ---- diagnostics (all in memory) ----
+    private class VStats {
+        var frames = 0; var keyFrames = 0; var bytes = 0L
+        var firstPts = -1L; var lastPts = -1L
+        var minIv = Long.MAX_VALUE; var maxIv = 0L; var sumIv = 0L; var nIv = 0; var hitches = 0
+        val perSecFrames = ArrayList<Int>(); val perSecBytes = ArrayList<Long>()
+        var hitchLines = 0
+    }
+
+    private class AStats {
+        var chunks = 0L; var silentChunks = 0L; var readErrors = 0; var stallJumps = 0; var stallTotalUs = 0L
+        var inputMiss = 0; var aacBuffers = 0L; var aacBytes = 0L
+        var micChunks = 0L; var micShort = 0L; var micOverflows = 0
+        var maxReadGapUs = 0L; var slowReads = 0; var lastReadAtUs = 0L
+        var firstPtsUs = Long.MIN_VALUE
+        var timestampAnchor = "n/a"
+    }
+
+    private val head = RecLog()
+    private val log = RecLog()
+    private val vs = VStats()
+    private val aus = AStats()
+    private var baseName = "NyteRec_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+    private var stopReason = "n/a"
+    private var armedAtMs = -1L
+    private var waitedMs = -1L
+    private var recStartMs = -1L
+    private var batteryStart = ""
+    private var maxBatteryC = Double.NaN
+    private var lastRotation = -1
+    private var lastDisplaySize = ""
+    private var rotListener: DisplayManager.DisplayListener? = null
+    private var thermalListener: PowerManager.OnThermalStatusChangedListener? = null
+    private var vMetrics = ""
+    private var aMetrics = ""
+    private var videoFormatLines = ""
 
     private val stopped = AtomicBoolean(false)
     @Volatile private var audioStop = false
@@ -80,20 +122,59 @@ class RecordingEngine(
         private set
     val notes = ArrayList<String>()
 
+    private fun note(msg: String) {
+        notes += msg
+        log.line("NOTE: $msg")
+    }
+
+    private fun displayDesc(): String {
+        val dm = ctx.getSystemService(DisplayManager::class.java)
+        val d = dm.getDisplay(Display.DEFAULT_DISPLAY)
+        val nd = CodecSupport.nativeDisplay(ctx)
+        return "rotation=${d.rotation} ${if (nd.landscape) "landscape" else "portrait"} real=${if (nd.landscape) nd.long else nd.short}x${if (nd.landscape) nd.short else nd.long} refresh=${"%.1f".format(Locale.US, d.refreshRate)}Hz"
+    }
+
     /**
      * Starts now, or - when the canvas must be landscape but the screen is currently portrait - arms
      * and waits (cheaply, via a DisplayListener) until the screen becomes landscape. That way the
      * recording never begins with a portrait screen squeezed into a landscape frame.
      */
     fun begin(onStarted: () -> Unit) {
-        val needLandscape = settings.orient == Orient.LANDSCAPE
+        head.raw("Nyte Recorder diagnostic log")
+        head.raw("Recording: $baseName")
+        head.raw("Written: ${SimpleDateFormat("yyyy-MM-dd HH:mm:ss Z", Locale.US).format(Date())}")
+        RecLog.deviceInfo(ctx).forEach { head.raw(it) }
+        head.raw("Settings: res=${settings.res} fps=${settings.fps} bitrate=${settings.bitrateMbps}Mbps codec=${settings.codec} orientation=${settings.orient} mic=${settings.mic} overlay=${settings.overlay}")
+        log.line("begin(): ${displayDesc()}")
+        log.line("start state: ${RecLog.thermalBattery(ctx)}")
+
         val dm = ctx.getSystemService(DisplayManager::class.java)
+        // Always-on, cheap: log rotation / size changes for the whole session.
+        val rl = object : DisplayManager.DisplayListener {
+            override fun onDisplayAdded(displayId: Int) {}
+            override fun onDisplayRemoved(displayId: Int) {}
+            override fun onDisplayChanged(displayId: Int) {
+                if (displayId != Display.DEFAULT_DISPLAY) return
+                val d = dm.getDisplay(Display.DEFAULT_DISPLAY) ?: return
+                val desc = displayDesc()
+                if (d.rotation != lastRotation || desc != lastDisplaySize) {
+                    lastRotation = d.rotation; lastDisplaySize = desc
+                    log.line("display changed: $desc")
+                }
+            }
+        }
+        rotListener = rl
+        dm.registerDisplayListener(rl, Handler(Looper.getMainLooper()))
+
+        val needLandscape = settings.orient == Orient.LANDSCAPE
         if (!needLandscape || CodecSupport.nativeDisplay(ctx).landscape) {
             start()
             onStarted()
             return
         }
         waiting = true
+        armedAtMs = log.elapsedMs()
+        log.line("armed: screen is portrait, waiting for landscape")
         val l = object : DisplayManager.DisplayListener {
             override fun onDisplayAdded(displayId: Int) {}
             override fun onDisplayRemoved(displayId: Int) {}
@@ -101,14 +182,17 @@ class RecordingEngine(
                 if (displayId != Display.DEFAULT_DISPLAY || stopped.get() || !waiting) return
                 if (!CodecSupport.nativeDisplay(ctx).landscape) return
                 waiting = false
+                waitedMs = log.elapsedMs() - armedAtMs
+                log.line("landscape reached after waiting $waitedMs ms; starting")
                 dm.unregisterDisplayListener(this)
                 displayListener = null
                 try {
                     start()
                     onStarted()
                 } catch (e: Exception) {
+                    log.error("start after waiting failed", e)
                     startError = "Could not start: ${e.message ?: e.javaClass.simpleName}"
-                    stop()
+                    stop("start failed")
                 }
             }
         }
@@ -116,18 +200,35 @@ class RecordingEngine(
         dm.registerDisplayListener(l, Handler(Looper.getMainLooper()))
         // Needed on Android 14+ before a projection can sit idle; harmless earlier.
         projection.registerCallback(object : MediaProjection.Callback() {
-            override fun onStop() { stop() }
+            override fun onStop() { stop("MediaProjection.onStop while waiting") }
         }, Handler(Looper.getMainLooper()))
     }
 
     /** Sets everything up and starts recording. Throws on a fatal error (caller cleans up via [stop]). */
     fun start() {
+        try {
+            doStart()
+        } catch (e: Exception) {
+            log.error("start() failed", e)
+            throw e
+        }
+    }
+
+    private fun doStart() {
+        baseName = "NyteRec_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+        head.raw("Recording (final name): $baseName")
         val p = CodecSupport.plan(ctx, settings)
         plan = p
         notes += p.notes
+        p.notes.forEach { log.line("plan note: $it") }
+        log.line("plan: ${p.width}x${p.height} @${p.fps}fps ${p.bitrate / 1000}kbps mime=${p.mime} encoder=${p.codecName ?: "NONE(system default)"} dpi=${p.dpi} reportedMaxFps=${p.maxFps} forcedFps=${p.fpsForced} align=${p.alignment}")
+        log.raw("  hardware ${p.mime} encoders on device: " + CodecSupport.listEncoders(p.mime).joinToString(" | "))
+        p.codecName?.let { n ->
+            MediaCodecList_find(n)?.let { info -> CodecSupport.describe(info, p.mime, p.width, p.height).forEach { log.raw("  $it") } }
+        }
 
         // --- Output file in Movies/NyteRecorder (MediaStore, no storage permission needed) ---
-        val name = "NyteRec_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date()) + ".mp4"
+        val name = "$baseName.mp4"
         val values = ContentValues().apply {
             put(MediaStore.Video.Media.DISPLAY_NAME, name)
             put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
@@ -139,30 +240,50 @@ class RecordingEngine(
         uri = u
         pfd = resolver.openFileDescriptor(u, "rw") ?: error("Cannot open output file")
         val muxer = MediaMuxer(pfd!!.fileDescriptor, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+        log.line("output: Movies/NyteRecorder/$name")
 
         // --- Audio (optional, failure is non-fatal) ---
         val audioOk = setupAudio()
         sink = MuxerSink(muxer, if (audioOk) 2 else 1)
+        log.line("audio ${if (audioOk) "enabled (internal${if (micRec != null) " + mic" else ""})" else "DISABLED, video only"}")
 
         // --- Video encoder ---
         setupVideoEncoder(p)
 
+        // thermal events
+        try {
+            val pm = ctx.getSystemService(PowerManager::class.java)
+            val tl = PowerManager.OnThermalStatusChangedListener { st -> log.line("thermal status -> ${RecLog.thermalName(st)} | ${RecLog.thermalBattery(ctx)}") }
+            thermalListener = tl
+            pm.addThermalStatusListener(ctx.mainExecutor, tl)
+        } catch (e: Throwable) {
+            log.line("thermal listener unavailable: $e")
+        }
+
         // --- Projection + VirtualDisplay (callback must be registered first on Android 14+) ---
         val cb = object : MediaProjection.Callback() {
             override fun onStop() {
-                stop()
+                stop("MediaProjection.onStop (system or user ended the projection)")
             }
         }
         callback = cb
         projection.registerCallback(cb, Handler(Looper.getMainLooper()))
+        log.line("creating VirtualDisplay ${p.width}x${p.height} dpi=${p.dpi} flags=AUTO_MIRROR; ${displayDesc()}")
         vdisplay = projection.createVirtualDisplay(
             "NyteRecorder", p.width, p.height, p.dpi,
             DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, surface, null, null,
         )
 
+        recStartMs = log.elapsedMs()
+        batteryStart = RecLog.thermalBattery(ctx)
+        maxBatteryC = RecLog.batteryTempC(ctx) ?: Double.NaN
+        log.line("RECORDING STARTED: $batteryStart")
         videoThread = Thread({ videoLoop() }, "nr-video").also { it.start() }
         if (audioOk) audioThread = Thread({ audioLoop() }, "nr-audio").also { it.start() }
     }
+
+    private fun MediaCodecList_find(name: String): MediaCodecInfo? =
+        android.media.MediaCodecList(android.media.MediaCodecList.REGULAR_CODECS).codecInfos.firstOrNull { it.name == name }
 
     // ------------------------------------------------------------------ video
 
@@ -193,20 +314,28 @@ class RecordingEngine(
         attempts += false to p.fps
         if (p.fps > 30) attempts += false to 30
         var lastErr: Exception? = null
+        var n = 0
         for ((full, fps) in attempts) {
+            n++
+            val fmt = format(full, fps)
+            log.line("encoder attempt #$n (${if (full) "full tuning" else "basic"}, ${fps}fps): configure $fmt")
             val enc = create()
             try {
-                enc.configure(format(full, fps), null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+                enc.configure(fmt, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
                 surface = enc.createInputSurface()
                 enc.start()
                 venc = enc
                 effFps = fps
-                if (!full) notes += "Encoder rejected some tuning options, using basic config."
-                if (fps != p.fps) notes += "Encoder refused ${p.fps} fps at ${p.width}x${p.height}; recording at $fps fps."
+                if (!full) note("Encoder rejected some tuning options, using basic config.")
+                if (fps != p.fps) note("Encoder refused ${p.fps} fps at ${p.width}x${p.height}; recording at $fps fps.")
+                log.line("encoder attempt #$n OK: ${enc.name}")
+                videoFormatLines = "configured: $fmt\naccepted (inputFormat): ${runCatching { enc.inputFormat }.getOrNull()}"
+                log.raw("  accepted inputFormat: ${runCatching { enc.inputFormat }.getOrNull()}")
                 Log.i(TAG, "Video encoder ${enc.name} ${p.width}x${p.height}@$fps ${p.bitrate / 1000}kbps full=$full")
                 return
             } catch (e: Exception) {
                 Log.w(TAG, "Encoder config failed (full=$full fps=$fps)", e)
+                log.error("encoder attempt #$n failed", e)
                 lastErr = e
                 try { enc.release() } catch (_: Throwable) {}
             }
@@ -218,11 +347,17 @@ class RecordingEngine(
         val enc = venc ?: return
         val info = MediaCodec.BufferInfo()
         var offsetUs: Long? = null
+        val expectedIv = 1_000_000L / max(1, effFps)
+        var nextBatteryAt = SystemClock.elapsedRealtime() + 15_000
         try {
             while (true) {
                 val idx = enc.dequeueOutputBuffer(info, 10_000)
                 when {
-                    idx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> sink?.addTrack(VIDEO, enc.outputFormat)
+                    idx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
+                        log.line("video outputFormat: ${enc.outputFormat}")
+                        videoFormatLines += "\nfinal outputFormat: ${enc.outputFormat}"
+                        sink?.addTrack(VIDEO, enc.outputFormat)
+                    }
                     idx >= 0 -> {
                         val buf = enc.getOutputBuffer(idx)
                         val eos = info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0
@@ -231,24 +366,54 @@ class RecordingEngine(
                                 // Surface timestamps are normally CLOCK_MONOTONIC. If the codec rebased them, realign.
                                 val nowUs = System.nanoTime() / 1000
                                 offsetUs = if (abs(info.presentationTimeUs - nowUs) < 10_000_000) 0L else nowUs - info.presentationTimeUs
+                                log.line("first video frame: pts=${info.presentationTimeUs}us, monotonic now=${nowUs}us, clock offset applied=${offsetUs}us (${if (offsetUs == 0L) "surface pts are CLOCK_MONOTONIC" else "codec rebased pts"})")
                             }
-                            sink?.write(VIDEO, buf, info.offset, info.size, info.presentationTimeUs + offsetUs, info.flags)
+                            val pts = info.presentationTimeUs + offsetUs
+                            record(pts, info.size, info.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME != 0, expectedIv)
+                            sink?.write(VIDEO, buf, info.offset, info.size, pts, info.flags)
                         }
                         enc.releaseOutputBuffer(idx, false)
                         if (eos) break
                     }
                 }
+                val nowMs = SystemClock.elapsedRealtime()
+                if (nowMs >= nextBatteryAt) {
+                    nextBatteryAt = nowMs + 15_000
+                    RecLog.batteryTempC(ctx)?.let { if (maxBatteryC.isNaN() || it > maxBatteryC) maxBatteryC = it }
+                    log.line("periodic: ${RecLog.thermalBattery(ctx)}")
+                }
             }
         } catch (e: Exception) {
-            if (!stopped.get()) Log.e(TAG, "Video loop failed", e)
+            if (!stopped.get()) { Log.e(TAG, "Video loop failed", e); log.error("video loop failed", e) }
         }
+    }
+
+    private fun record(ptsUs: Long, size: Int, key: Boolean, expectedIv: Long) {
+        val v = vs
+        if (v.firstPts < 0) v.firstPts = ptsUs
+        v.frames++; v.bytes += size; if (key) v.keyFrames++
+        if (v.lastPts >= 0) {
+            val iv = ptsUs - v.lastPts
+            v.nIv++; v.sumIv += iv
+            if (iv < v.minIv) v.minIv = iv
+            if (iv > v.maxIv) v.maxIv = iv
+            if (iv > 50_000 && iv > expectedIv * 5 / 2) {
+                v.hitches++
+                if (v.hitchLines < 60) { v.hitchLines++; log.line("video gap: ${iv / 1000} ms between frames (expected ~${expectedIv / 1000} ms) at t=${(ptsUs - v.firstPts) / 1000} ms") }
+            }
+        }
+        v.lastPts = ptsUs
+        val sec = ((ptsUs - v.firstPts) / 1_000_000L).toInt()
+        while (v.perSecFrames.size <= sec) { v.perSecFrames += 0; v.perSecBytes += 0L }
+        v.perSecFrames[sec] = v.perSecFrames[sec] + 1
+        v.perSecBytes[sec] = v.perSecBytes[sec] + size
     }
 
     // ------------------------------------------------------------------ audio
 
     private fun setupAudio(): Boolean {
         if (ContextCompat.checkSelfPermission(ctx, android.Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
-            notes += "No microphone/audio permission: recording without audio."
+            note("No microphone/audio permission: recording without audio.")
             return false
         }
         try {
@@ -259,6 +424,7 @@ class RecordingEngine(
                 .build()
             val minBuf = AudioRecord.getMinBufferSize(SAMPLE_RATE, AudioFormat.CHANNEL_IN_STEREO, AudioFormat.ENCODING_PCM_16BIT)
             val bufSize = max(minBuf, CHUNK_BYTES * 8)
+            log.line("audio: minBuf=$minBuf bufSize=$bufSize usages=MEDIA,GAME,UNKNOWN")
             val cfg = AudioPlaybackCaptureConfiguration.Builder(projection)
                 .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
                 .addMatchingUsage(AudioAttributes.USAGE_GAME)
@@ -272,7 +438,7 @@ class RecordingEngine(
                 .build()
             if (rec.state != AudioRecord.STATE_INITIALIZED) {
                 rec.release()
-                notes += "Internal audio capture failed to initialize."
+                note("Internal audio capture failed to initialize.")
                 return false
             }
             internalRec = rec
@@ -287,7 +453,8 @@ class RecordingEngine(
                         .build()
                     if (m.state == AudioRecord.STATE_INITIALIZED) micRec = m else m.release()
                 } catch (e: Exception) {
-                    notes += "Microphone unavailable, recording internal audio only."
+                    log.error("mic init failed", e)
+                    note("Microphone unavailable, recording internal audio only.")
                 }
             }
 
@@ -297,13 +464,15 @@ class RecordingEngine(
                 setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, CHUNK_BYTES * 2)
             }
             val enc = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC)
+            log.line("audio encoder ${enc.name}: $af")
             enc.configure(af, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
             enc.start()
             aenc = enc
             return true
         } catch (e: Exception) {
             Log.e(TAG, "Audio setup failed", e)
-            notes += "Audio setup failed (${e.javaClass.simpleName}): recording video only."
+            log.error("audio setup failed", e)
+            note("Audio setup failed (${e.javaClass.simpleName}): recording video only.")
             releaseAudio()
             return false
         }
@@ -314,6 +483,7 @@ class RecordingEngine(
         val rec = internalRec ?: return
         val enc = aenc ?: return
         val mic = micRec
+        val a = aus
         val info = MediaCodec.BufferInfo()
         val pcm = ByteArray(CHUNK_BYTES)
         val micBuf = ByteArray(CHUNK_BYTES)
@@ -323,20 +493,24 @@ class RecordingEngine(
         var samples = 0L
         var anchorUs = 0L
         var first = true
-        var lastOutPts = Long.MIN_VALUE
+        var stallLines = 0
 
         fun drain(eos: Boolean) {
             var spins = 0
             while (true) {
                 val idx = enc.dequeueOutputBuffer(info, if (eos) 10_000 else 0)
                 when {
-                    idx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> sink?.addTrack(AUDIO, enc.outputFormat)
+                    idx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
+                        log.line("audio outputFormat: ${enc.outputFormat}")
+                        sink?.addTrack(AUDIO, enc.outputFormat)
+                    }
                     idx >= 0 -> {
                         val buf = enc.getOutputBuffer(idx)
                         val end = info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0
                         if (buf != null && info.size > 0 && info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG == 0) {
+                            if (a.firstPtsUs == Long.MIN_VALUE) a.firstPtsUs = info.presentationTimeUs
+                            a.aacBuffers++; a.aacBytes += info.size
                             sink?.write(AUDIO, buf, info.offset, info.size, info.presentationTimeUs, info.flags)
-                            lastOutPts = info.presentationTimeUs
                         }
                         enc.releaseOutputBuffer(idx, false)
                         if (end) return
@@ -349,31 +523,50 @@ class RecordingEngine(
         try {
             rec.startRecording()
             mic?.startRecording()
+            log.line("audio capture started")
             while (!audioStop) {
                 // Blocking read of exactly one AAC frame of internal audio.
                 var got = 0
                 while (got < CHUNK_BYTES && !audioStop) {
                     val n = rec.read(pcm, got, CHUNK_BYTES - got)
-                    if (n < 0) throw IllegalStateException("AudioRecord.read error $n")
+                    if (n < 0) { a.readErrors++; throw IllegalStateException("AudioRecord.read error $n") }
                     got += n
                 }
                 if (got < CHUNK_BYTES) break
                 val nowUs = System.nanoTime() / 1000
+                a.chunks++
+                if (a.lastReadAtUs != 0L) {
+                    val gap = nowUs - a.lastReadAtUs
+                    if (gap > a.maxReadGapUs) a.maxReadGapUs = gap
+                    if (gap > 3 * chunkUs) a.slowReads++
+                }
+                a.lastReadAtUs = nowUs
+                // Cheap silence check: sample every 64th byte pair.
+                var peak = 0
+                var i = 0
+                while (i + 1 < CHUNK_BYTES) { val s = abs(((pcm[i + 1].toInt() shl 8) or (pcm[i].toInt() and 0xFF)).toShort().toInt()); if (s > peak) peak = s; i += 64 }
+                if (peak == 0) a.silentChunks++
 
                 if (first) {
                     first = false
-                    var a = nowUs - chunkUs
+                    var an = nowUs - chunkUs
                     val ts = AudioTimestamp()
                     if (rec.getTimestamp(ts, AudioTimestamp.TIMEBASE_MONOTONIC) == AudioRecord.SUCCESS) {
                         val candidate = ts.nanoTime / 1000 - ts.framePosition * 1_000_000L / SAMPLE_RATE
-                        if (abs(candidate - a) < 500_000) a = candidate
-                    }
-                    anchorUs = a
+                        if (abs(candidate - an) < 500_000) { an = candidate; a.timestampAnchor = "AudioRecord.getTimestamp (offset vs read-time ${(candidate - (nowUs - chunkUs)) / 1000} ms)" }
+                        else a.timestampAnchor = "read-time (getTimestamp off by ${(candidate - an) / 1000} ms, rejected)"
+                    } else a.timestampAnchor = "read-time (getTimestamp unavailable)"
+                    anchorUs = an
+                    log.line("audio first chunk anchor: ${a.timestampAnchor}")
                 } else {
                     // If capture stalled (nothing playing), jump the clock forward instead of drifting behind.
                     val expected = anchorUs + samples * 1_000_000L / SAMPLE_RATE
                     val actual = nowUs - chunkUs
-                    if (actual - expected > 200_000) anchorUs += actual - expected
+                    if (actual - expected > 200_000) {
+                        a.stallJumps++; a.stallTotalUs += actual - expected
+                        if (stallLines < 40) { stallLines++; log.line("audio gap: capture stalled ${(actual - expected) / 1000} ms, clock jumped forward") }
+                        anchorUs += actual - expected
+                    }
                 }
                 val pts = anchorUs + samples * 1_000_000L / SAMPLE_RATE
                 samples += FRAME_SAMPLES
@@ -385,11 +578,14 @@ class RecordingEngine(
                             val drop = micCount + n - micFifo.size
                             System.arraycopy(micFifo, drop, micFifo, 0, micCount - drop)
                             micCount -= drop
+                            a.micOverflows++
                         }
                         System.arraycopy(micBuf, 0, micFifo, micCount, n)
                         micCount += n
                     }
                     val take = minOf(micCount, CHUNK_BYTES)
+                    a.micChunks++
+                    if (take < CHUNK_BYTES) a.micShort++
                     if (take > 0) {
                         mix(pcm, micFifo, take)
                         System.arraycopy(micFifo, take, micFifo, 0, micCount - take)
@@ -403,7 +599,7 @@ class RecordingEngine(
                     ib.clear()
                     ib.put(pcm, 0, CHUNK_BYTES)
                     enc.queueInputBuffer(ii, 0, CHUNK_BYTES, pts, 0)
-                }
+                } else a.inputMiss++
                 drain(false)
             }
             // End of stream
@@ -414,7 +610,7 @@ class RecordingEngine(
                 drain(true)
             }
         } catch (e: Exception) {
-            if (!stopped.get()) Log.e(TAG, "Audio loop failed", e)
+            if (!stopped.get()) { Log.e(TAG, "Audio loop failed", e); log.error("audio loop failed", e) }
         }
     }
 
@@ -440,18 +636,26 @@ class RecordingEngine(
     // ------------------------------------------------------------------ stop
 
     /** Idempotent. Finalizes the file on a background thread, then calls [onFinished]. */
-    fun stop() {
+    fun stop(reason: String = "stop requested (notification, app button or bubble)") {
         if (!stopped.compareAndSet(false, true)) return
+        stopReason = reason
+        log.line("STOP: $reason")
         Thread({ finalizeAll() }, "nr-finalize").start()
     }
 
+    private fun bundleDump(b: android.os.BaseBundle?): String =
+        b?.keySet()?.sorted()?.joinToString("\n") { "    $it = ${b.get(it)}" } ?: "    (none)"
+
     private fun finalizeAll() {
         var error: String? = startError
-        displayListener?.let { l ->
-            try { ctx.getSystemService(DisplayManager::class.java).unregisterDisplayListener(l) } catch (_: Throwable) {}
-            displayListener = null
-        }
+        val stopAtMs = log.elapsedMs()
+        val dm = ctx.getSystemService(DisplayManager::class.java)
+        displayListener?.let { l -> try { dm.unregisterDisplayListener(l) } catch (_: Throwable) {}; displayListener = null }
+        rotListener?.let { l -> try { dm.unregisterDisplayListener(l) } catch (_: Throwable) {}; rotListener = null }
+        thermalListener?.let { l -> try { ctx.getSystemService(PowerManager::class.java).removeThermalStatusListener(l) } catch (_: Throwable) {}; thermalListener = null }
         waiting = false
+        val endState = RecLog.thermalBattery(ctx)
+        RecLog.batteryTempC(ctx)?.let { if (maxBatteryC.isNaN() || it > maxBatteryC) maxBatteryC = it }
         try { vdisplay?.release() } catch (_: Throwable) {}
         try { callback?.let { projection.unregisterCallback(it) } } catch (_: Throwable) {}
         try { projection.stop() } catch (_: Throwable) {}
@@ -461,13 +665,17 @@ class RecordingEngine(
         audioThread?.let {
             it.join(1500)
             if (it.isAlive) {
+                log.line("audio thread did not exit in time; forcing AudioRecord.stop()")
                 try { internalRec?.stop() } catch (_: Throwable) {}
                 it.join(1500)
             }
         }
+        // Codec / AudioRecord metrics, captured before release.
+        try { vMetrics = bundleDump(venc?.metrics) } catch (_: Throwable) {}
+        try { aMetrics = bundleDump(internalRec?.metrics) } catch (_: Throwable) {}
         val s = sink
         val wrote = s?.wroteSamples == true
-        try { s?.finish() } catch (e: Throwable) { error = e.message }
+        try { s?.finish() } catch (e: Throwable) { error = e.message; log.error("muxer finish failed", e) }
         try { pfd?.close() } catch (_: Throwable) {}
         try { surface?.release() } catch (_: Throwable) {}
         try { venc?.stop() } catch (_: Throwable) {}
@@ -489,9 +697,133 @@ class RecordingEngine(
                     if (error == null) error = "Nothing was recorded."
                 }
             } catch (e: Throwable) {
+                log.error("finalizing MediaStore entry failed", e)
                 error = e.message
             }
         }
+        try { writeDiagnostics(result, error, stopAtMs, endState, s) } catch (e: Throwable) { Log.e(TAG, "log failed", e) }
         onFinished(result, error)
+    }
+
+    // ------------------------------------------------------------------ diagnostics output
+
+    private fun ms(us: Long) = String.format(Locale.US, "%.2f", us / 1000.0)
+
+    private fun writeDiagnostics(result: Uri?, error: String?, stopAtMs: Long, endState: String, s: MuxerSink?) {
+        val p = plan
+        val sum = RecLog()
+        sum.section("SUMMARY")
+        sum.raw("Result: " + if (result != null) "saved" else "no video saved")
+        sum.raw("Error: ${error ?: "none"}")
+        sum.raw("Stop reason: $stopReason")
+        if (armedAtMs >= 0) sum.raw("Waited for landscape: ${if (waitedMs >= 0) "$waitedMs ms" else "never reached landscape"}")
+        if (recStartMs >= 0) sum.raw("Wall-clock recording duration: ${(stopAtMs - recStartMs) / 1000.0} s")
+        sum.raw("Thermal/battery at start: ${batteryStart.ifEmpty { "n/a" }}")
+        sum.raw("Thermal/battery at end:   $endState")
+        sum.raw("Max battery temp seen: ${if (maxBatteryC.isNaN()) "n/a" else "%.1f C".format(Locale.US, maxBatteryC)}")
+        if (p != null) sum.raw("Selected: ${p.width}x${p.height} @${p.fps}fps (effective encoder fps $effFps) ${p.bitrate / 1000} kbps ${p.mime}, encoder=${p.codecName ?: "default"}")
+
+        sum.section("VIDEO (encoder output, measured in-process)")
+        val v = vs
+        if (v.frames == 0) sum.raw("No video frames were encoded.")
+        else {
+            val durUs = max(1L, v.lastPts - v.firstPts)
+            sum.raw("Frames encoded: ${v.frames} (key frames ${v.keyFrames}), bytes ${v.bytes}")
+            sum.raw("Video span: ${ms(durUs)} ms; average encoded fps: ${"%.2f".format(Locale.US, (v.frames - 1) * 1_000_000.0 / durUs)}")
+            sum.raw("Frame interval ms: avg=${if (v.nIv > 0) ms(v.sumIv / v.nIv) else "n/a"} min=${if (v.nIv > 0) ms(v.minIv) else "n/a"} max=${ms(v.maxIv)}; gaps > 2.5x expected & >50ms: ${v.hitches}")
+            sum.raw("Average video bitrate: ${"%.0f".format(Locale.US, v.bytes * 8 * 1_000_000.0 / durUs / 1000)} kbps")
+            sum.raw("Per-second output (sec: fps / kbps):")
+            val sb = StringBuilder("  ")
+            for (i in v.perSecFrames.indices) {
+                sb.append(i).append(": ").append(v.perSecFrames[i]).append('/').append(v.perSecBytes[i] * 8 / 1000).append("   ")
+                if ((i + 1) % 6 == 0) sb.append("\n  ")
+            }
+            sum.raw(sb.toString().trimEnd())
+        }
+        sum.raw("Note: frames received from the VirtualDisplay and frames dropped by the fps cap are not visible to the app")
+        sum.raw("      (surface input has no per-frame callback by design, to avoid overhead). Encoded frames/intervals above are exact.")
+        sum.raw("Video formats:\n$videoFormatLines")
+        sum.raw("MediaCodec metrics (video):\n$vMetrics")
+
+        sum.section("AUDIO")
+        val a = aus
+        sum.raw("PCM chunks (1024 frames each): ${a.chunks}, silent chunks: ${a.silentChunks}, read errors: ${a.readErrors}")
+        sum.raw("Capture stalls (clock jumps >200ms): ${a.stallJumps}, total ${a.stallTotalUs / 1000} ms; max gap between reads ${a.maxReadGapUs / 1000} ms; slow reads (>3 chunks): ${a.slowReads}")
+        sum.raw("AAC buffers out: ${a.aacBuffers}, bytes ${a.aacBytes}; encoder input unavailable (dropped chunks): ${a.inputMiss}")
+        if (settings.mic) sum.raw("Mic chunks: ${a.micChunks}, short/padded: ${a.micShort}, FIFO overflows: ${a.micOverflows}")
+        sum.raw("First-sample clock anchor: ${a.timestampAnchor}")
+        sum.raw("AudioRecord metrics:\n$aMetrics")
+
+        sum.section("A/V SYNC")
+        if (s != null) {
+            val vf = s.firstRawPts[VIDEO]; val af = s.firstRawPts[AUDIO]
+            val base = s.rebaseBase
+            sum.raw("First video pts (monotonic): ${if (vf == Long.MIN_VALUE) "n/a" else "$vf us"}")
+            sum.raw("First audio pts (monotonic): ${if (af == Long.MIN_VALUE) "n/a" else "$af us"}")
+            if (vf != Long.MIN_VALUE && af != Long.MIN_VALUE) sum.raw("Audio starts ${ms(af - vf)} ms ${if (af >= vf) "after" else "before"} video")
+            if (base != Long.MAX_VALUE) {
+                if (vf != Long.MIN_VALUE) sum.raw("Video start in file: ${ms(vf - base)} ms; ")
+                if (af != Long.MIN_VALUE) sum.raw("Audio start in file: ${ms(af - base)} ms")
+            }
+            sum.raw("Samples muxed: video ${s.sampleCount[VIDEO]}, audio ${s.sampleCount[AUDIO]}")
+        }
+
+        sum.section("POST-RECORDING VERIFICATION (read back from the saved file)")
+        if (result != null) verify(result, p, sum) else sum.raw("No file to verify.")
+        sum.raw()
+        val text = head.toString() + sum.toString() + "\n=== EVENTS ===\n" + log.toString()
+        val u = RecLog.writeFile(ctx, baseName, text)
+        Log.i(TAG, "diagnostic log: ${u ?: "WRITE FAILED"}")
+    }
+
+    private fun verify(u: Uri, p: CodecSupport.Plan?, out: RecLog) {
+        try {
+            val r = MediaMetadataRetriever()
+            r.setDataSource(ctx, u)
+            fun m(k: Int) = r.extractMetadata(k)
+            val w = m(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toIntOrNull()
+            val h = m(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toIntOrNull()
+            val durMs = m(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull()
+            val br = m(MediaMetadataRetriever.METADATA_KEY_BITRATE)?.toLongOrNull()
+            out.raw("Container: ${w}x$h rotation=${m(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)} duration=${durMs} ms bitrate=${br?.div(1000)} kbps hasAudio=${m(MediaMetadataRetriever.METADATA_KEY_HAS_AUDIO)} hasVideo=${m(MediaMetadataRetriever.METADATA_KEY_HAS_VIDEO)} frameCount=${m(MediaMetadataRetriever.METADATA_KEY_VIDEO_FRAME_COUNT)} captureFps=${m(MediaMetadataRetriever.METADATA_KEY_CAPTURE_FRAMERATE)}")
+            r.release()
+
+            val ex = MediaExtractor()
+            ex.setDataSource(ctx, u, null)
+            var videoFps = Double.NaN
+            for (t in 0 until ex.trackCount) {
+                val f = ex.getTrackFormat(t)
+                val mime = f.getString(MediaFormat.KEY_MIME) ?: continue
+                ex.selectTrack(t)
+                var count = 0; var first = -1L; var last = -1L; var minIv = Long.MAX_VALUE; var maxIv = 0L; var prev = -1L
+                while (true) {
+                    val ts = ex.sampleTime
+                    if (ts < 0) break
+                    count++
+                    if (first < 0) first = ts
+                    if (prev >= 0) { val iv = ts - prev; if (iv > 0 && iv < minIv) minIv = iv; if (iv > maxIv) maxIv = iv }
+                    prev = ts; last = ts
+                    if (!ex.advance()) break
+                }
+                ex.unselectTrack(t)
+                val span = max(1L, last - first)
+                val fps = if (count > 1) (count - 1) * 1_000_000.0 / span else 0.0
+                out.raw("Track $t $mime: samples=$count first=${ms(first)} ms span=${ms(span)} ms avg rate=${"%.2f".format(Locale.US, fps)}/s min interval=${if (minIv == Long.MAX_VALUE) "n/a" else ms(minIv)} ms max interval=${ms(maxIv)} ms | $f")
+                if (mime.startsWith("video/")) videoFps = fps
+            }
+            ex.release()
+
+            val size = ctx.contentResolver.openFileDescriptor(u, "r")?.use { it.statSize } ?: -1L
+            val actualBr = if (durMs != null && durMs > 0 && size > 0) size * 8 * 1000 / durMs else null
+            out.raw("File size: $size bytes; average total bitrate from size/duration: ${actualBr?.div(1000)} kbps")
+            if (p != null) {
+                out.raw("Selected vs actual:")
+                out.raw("  size:    selected ${p.width}x${p.height}, actual ${w}x$h -> ${if (w == p.width && h == p.height) "OK" else "MISMATCH"}")
+                out.raw("  fps:     selected ${effFps}, actual average ${"%.2f".format(Locale.US, videoFps)} -> ${if (videoFps.isNaN()) "n/a" else if (videoFps >= effFps * 0.9) "OK" else "BELOW TARGET (static screen content also lowers this: surface input only emits frames when the screen changes)"}")
+                out.raw("  bitrate: selected video ${p.bitrate / 1000} kbps (+192 audio), actual average ${actualBr?.div(1000)} kbps -> ${if (actualBr == null) "n/a" else if (actualBr <= p.bitrate * 1.3 + 192_000) "OK (VBR average at or under target)" else "OVER TARGET"}")
+            }
+        } catch (e: Throwable) {
+            out.raw("Verification failed: ${e.javaClass.simpleName}: ${e.message}")
+        }
     }
 }

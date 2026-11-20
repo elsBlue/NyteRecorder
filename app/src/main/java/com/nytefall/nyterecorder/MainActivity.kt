@@ -241,7 +241,10 @@ private fun Screen() {
             }
 
             item { Label("Recent recordings") }
-            if (recs.isEmpty()) item { Text("Nothing yet. Files are saved to Movies/NyteRecorder.", fontSize = 13.sp, color = Color(0xFF9A9CA6)) }
+            item {
+                Text("Diagnostic logs (.log.txt, one per recording): ${RecLog.DIR}  - open it in the Files app.", fontSize = 12.sp, color = Color(0xFF9A9CA6))
+            }
+            if (recs.isEmpty()) item { Text("Nothing yet. Videos are saved to Movies/NyteRecorder.", fontSize = 13.sp, color = Color(0xFF9A9CA6)) }
             items(recs, key = { it.uri.toString() }) { r ->
                 Column(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surface, RoundedCornerShape(14.dp)).padding(12.dp)) {
                     Text(r.name, fontSize = 14.sp, fontWeight = FontWeight.Medium)
@@ -252,6 +255,9 @@ private fun Screen() {
                     Row {
                         TextButton({ Recordings.play(ctx, r) }) { Text("Play") }
                         TextButton({ Recordings.share(ctx, r) }) { Text("Share") }
+                        TextButton({
+                            if (!Recordings.shareLog(ctx, r)) Toast.makeText(ctx, "No log found for this recording.", Toast.LENGTH_SHORT).show()
+                        }) { Text("Share log") }
                         TextButton({
                             if (Recordings.delete(ctx, r)) recs.remove(r)
                             else Toast.makeText(ctx, "Can't delete this file from here.", Toast.LENGTH_SHORT).show()
