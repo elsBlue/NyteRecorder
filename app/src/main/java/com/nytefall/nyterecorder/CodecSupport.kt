@@ -54,7 +54,7 @@ object CodecSupport {
         val notes: List<String>,
         val maxFps: Double? = null, // what the encoder itself reports for this exact size
         val alignment: Int = 16,
-        val fpsForced: Boolean = false, // requested fps not in the declared range, but we try it anyway
+        val bitrateMode: Int = MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR,
     ) {
         val hardware get() = codecName != null
     }
@@ -95,7 +95,7 @@ object CodecSupport {
         val outH = if (landscape) sh else l
         val aspect = outW / outH
 
-        val fps = s.fps
+        val reqFps = s.fps
         var bitrate = s.bitrateMbps * 1_000_000
         val caps = info?.getCapabilitiesForType(codec.mime)?.videoCapabilities
         // Hardware encoders want macroblock-aligned sizes (1920x862 is rejected for 60 fps on the Unisoc one).
@@ -103,10 +103,15 @@ object CodecSupport {
         val firstW = align(outW, a)
         val firstH = align(outH, a)
 
-        if (caps == null) return Plan(info?.name, codec.mime, firstW, firstH, nd.dpi, fps, bitrate, notes, alignment = a)
+        if (caps == null) return Plan(info?.name, codec.mime, firstW, firstH, nd.dpi, reqFps, bitrate, notes, alignment = a)
 
         bitrate = bitrate.coerceIn(caps.bitrateRange.lower, caps.bitrateRange.upper)
+        // CBR honours the selected bitrate far better than VBR (VBR undershot: 16 Mbps selected -> 11 actual).
+        val enc = info.getCapabilitiesForType(codec.mime).encoderCapabilities
+        val mode = if (enc != null && enc.isBitrateModeSupported(MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR))
+            MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR else MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR
         fun rateAt(w: Int, h: Int): Double? = runCatching { caps.getSupportedFrameRatesFor(w, h).upper }.getOrNull()
+        fun fpsOk(w: Int, h: Int, f: Int) = caps.areSizeAndRateSupported(w, h, f.toDouble())
 
         // Candidates: the ideal aligned size first, then slightly narrower 16-aligned sizes with nearly the same aspect.
         val candidates = ArrayList<Pair<Int, Int>>()
@@ -117,22 +122,31 @@ object CodecSupport {
             w -= a
         }
         val supported = candidates.filter { (cw, ch) -> caps.isSizeSupported(cw, ch) }
-        val withRate = supported.firstOrNull { (cw, ch) -> caps.areSizeAndRateSupported(cw, ch, fps.toDouble()) }
+        val withRate = supported.firstOrNull { (cw, ch) -> fpsOk(cw, ch, reqFps) }
 
         val chosen: Pair<Int, Int>
-        var forced = false
+        var fps = reqFps
         if (withRate != null) {
             chosen = withRate
-            if (chosen != candidates[0]) notes += "${candidates[0].first}x${candidates[0].second} can't do $fps fps on this encoder; using ${chosen.first}x${chosen.second} to keep $fps fps."
+            if (chosen != candidates[0]) notes += "${candidates[0].first}x${candidates[0].second} can't do $reqFps fps on this encoder; using ${chosen.first}x${chosen.second} to keep $reqFps fps."
         } else if (supported.isNotEmpty()) {
+            // Never go above what the encoder declares: clamp to the best supported rate <= requested.
             chosen = supported[0]
-            forced = fps > 30
-            if (forced) notes += "Encoder reports max ${rateAt(chosen.first, chosen.second)?.toInt() ?: "?"} fps at ${chosen.first}x${chosen.second}; trying $fps fps anyway."
+            val limit = rateAt(chosen.first, chosen.second)?.toInt()
+            fps = listOf(60, 30, 24, 15).firstOrNull { it <= reqFps && fpsOk(chosen.first, chosen.second, it) }
+                ?: min(reqFps, max(1, limit ?: 15))
+            notes += "Encoder supports up to ${limit ?: "?"} fps at ${chosen.first}x${chosen.second}; using $fps fps."
         } else {
             chosen = candidates[0]
             notes += "Encoder reports ${candidates[0].first}x${candidates[0].second} unsupported; trying anyway."
         }
-        return Plan(info?.name, codec.mime, chosen.first, chosen.second, nd.dpi, fps, bitrate, notes, rateAt(chosen.first, chosen.second), a, forced)
+        return Plan(info.name, codec.mime, chosen.first, chosen.second, nd.dpi, fps, bitrate, notes, rateAt(chosen.first, chosen.second), a, mode)
+    }
+
+    /** True if the encoder declares support for 60 fps at the 1080p-class size of [s] (used to enable the 60 fps chip). */
+    fun supports60(ctx: Context, s: RecSettings): Pair<Boolean, Int?> {
+        val p = plan(ctx, s.copy(fps = 60))
+        return (p.fps >= 60) to p.maxFps?.toInt()
     }
 
     // ---------------------------------------------------------------- diagnostics

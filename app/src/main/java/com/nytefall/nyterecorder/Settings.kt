@@ -12,7 +12,7 @@ enum class Codec(val label: String, val mime: String) {
 /** Defaults tuned for the lightest load on the nubia Neo 5G (Unisoc T820) while keeping good quality. */
 data class RecSettings(
     val res: Res = Res.P1080,
-    val fps: Int = 60,
+    val fps: Int = 30,
     val bitrateMbps: Int = 12,
     val codec: Codec = Codec.AVC,
     val orient: Orient = Orient.LANDSCAPE,
@@ -28,7 +28,7 @@ object SettingsStore {
         val d = RecSettings()
         return RecSettings(
             res = runCatching { Res.valueOf(p.getString("res", d.res.name)!!) }.getOrDefault(d.res),
-            fps = p.getInt("fps", d.fps),
+            fps = p.getInt("fps30", d.fps),
             bitrateMbps = p.getInt("bitrate", d.bitrateMbps),
             codec = runCatching { Codec.valueOf(p.getString("codec", d.codec.name)!!) }.getOrDefault(d.codec),
             orient = runCatching { Orient.valueOf(p.getString("orient", d.orient.name)!!) }.getOrDefault(d.orient),
@@ -40,7 +40,7 @@ object SettingsStore {
     fun save(c: Context, s: RecSettings) {
         prefs(c).edit()
             .putString("res", s.res.name)
-            .putInt("fps", s.fps)
+            .putInt("fps30", s.fps)
             .putInt("bitrate", s.bitrateMbps)
             .putString("codec", s.codec.name)
             .putString("orient", s.orient.name)

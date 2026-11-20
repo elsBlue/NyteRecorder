@@ -76,7 +76,14 @@ class MainActivity : ComponentActivity() {
                     onBackground = Color(0xFFECECEF), onSurface = Color(0xFFECECEF),
                     secondaryContainer = Color(0xFF3A1D22), onSecondaryContainer = Color.White,
                 ),
-            ) { Screen() }
+            ) {
+                // Explicit surface so every Text without its own colour defaults to onBackground (light), never black.
+                androidx.compose.material3.Surface(
+                    modifier = Modifier.fillMaxSize(),
+                    color = MaterialTheme.colorScheme.background,
+                    contentColor = MaterialTheme.colorScheme.onBackground,
+                ) { Screen() }
+            }
         }
     }
 }
@@ -102,6 +109,11 @@ private fun Screen() {
     val hevc = remember { CodecSupport.hevcAvailable() }
     var plan by remember { mutableStateOf<CodecSupport.Plan?>(null) }
     LaunchedEffect(s) { plan = CodecSupport.plan(ctx, s) }
+    var fps60 by remember { mutableStateOf(true to (null as Int?)) }
+    LaunchedEffect(s.res, s.codec, s.orient) {
+        fps60 = CodecSupport.supports60(ctx, s)
+        if (!fps60.first && s.fps > 30) update(s.copy(fps = 30))
+    }
     val native = remember { CodecSupport.nativeDisplay(ctx) }
 
     var step by remember { mutableStateOf(Step.IDLE) }
@@ -166,7 +178,7 @@ private fun Screen() {
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
             item {
-                Text("Nyte Recorder", fontSize = 26.sp, fontWeight = FontWeight.Bold)
+                Text("Nyte Recorder", fontSize = 26.sp, fontWeight = FontWeight.Bold, color = Color(0xFFF2F2F5))
                 Text("Internal audio · hardware encoder · built for gaming", fontSize = 13.sp, color = Color(0xFF9A9CA6))
             }
             item {
@@ -192,8 +204,14 @@ private fun Screen() {
                 )
             }
             item { Label("Frame rate") }
-            item { Chips(listOf(30, 60), s.fps, { "$it fps" }) { update(s.copy(fps = it)) } }
-            item { Label("Bitrate (VBR)") }
+            item {
+                Chips(listOf(30, 60), s.fps, { "$it fps" }, enabled = { it <= 30 || fps60.first }) { update(s.copy(fps = it)) }
+                if (!fps60.first) Text(
+                    "60 fps isn't supported by this phone's hardware encoder at this size (up to ${fps60.second ?: 30} fps).",
+                    fontSize = 12.sp, color = Color(0xFFFFB74D),
+                )
+            }
+            item { Label("Bitrate") }
             item { Chips(listOf(8, 12, 16), s.bitrateMbps, { "$it Mbps" }) { update(s.copy(bitrateMbps = it)) } }
             item { Label("Codec") }
             item {
@@ -220,9 +238,9 @@ private fun Screen() {
                     Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surface, RoundedCornerShape(14.dp)).padding(14.dp),
                     verticalArrangement = Arrangement.spacedBy(4.dp),
                 ) {
-                    Text("This recording", fontWeight = FontWeight.SemiBold)
+                    Text("This recording", fontWeight = FontWeight.SemiBold, color = Color(0xFFF2F2F5))
                     if (p != null) {
-                        Text("${p.width}×${p.height} @ ${p.fps} fps · ${p.bitrate / 1_000_000} Mbps · ${if (p.mime == Codec.AVC.mime) "H.264" else "H.265"}", fontSize = 13.sp)
+                        Text("${p.width}×${p.height} @ ${p.fps} fps · ${p.bitrate / 1_000_000} Mbps ${if (p.bitrateMode == android.media.MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR) "CBR" else "VBR"} · ${if (p.mime == Codec.AVC.mime) "H.264" else "H.265"}", fontSize = 13.sp, color = Color(0xFFE6E6EA))
                         Text("Encoder: ${p.codecName ?: "none (hardware not found)"}", fontSize = 12.sp, color = Color(0xFF9A9CA6))
                         if (p.maxFps != null) Text("Encoder reports up to ${p.maxFps.toInt()} fps at this size (${p.alignment}px aligned)", fontSize = 12.sp, color = Color(0xFF9A9CA6))
                         p.notes.forEach { Text(it, fontSize = 12.sp, color = Color(0xFFFFB74D)) }
@@ -247,11 +265,16 @@ private fun Screen() {
             if (recs.isEmpty()) item { Text("Nothing yet. Videos are saved to Movies/NyteRecorder.", fontSize = 13.sp, color = Color(0xFF9A9CA6)) }
             items(recs, key = { it.uri.toString() }) { r ->
                 Column(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surface, RoundedCornerShape(14.dp)).padding(12.dp)) {
-                    Text(r.name, fontSize = 14.sp, fontWeight = FontWeight.Medium)
+                    Text(r.name, fontSize = 14.sp, fontWeight = FontWeight.Medium, color = Color(0xFFF2F2F5))
                     Text(
                         "${fmtDur(r.durationMs)} · ${r.size / 1_048_576} MB · ${DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.SHORT).format(Date(r.dateSec * 1000))}",
                         fontSize = 12.sp, color = Color(0xFF9A9CA6),
                     )
+                    val v = remember(r.name, saved) { VerifyStore.get(ctx, r.name) }
+                    if (v != null) {
+                        Text("${if (v.ok) "✓" else "⚠"} ${v.summary}", fontSize = 12.sp, color = if (v.ok) Color(0xFF66D17A) else Color(0xFFFFB74D))
+                        if (!v.ok) Text("Doesn't match settings: ${v.note}", fontSize = 12.sp, color = Color(0xFFFFB74D))
+                    }
                     Row {
                         TextButton({ Recordings.play(ctx, r) }) { Text("Play") }
                         TextButton({ Recordings.share(ctx, r) }) { Text("Share") }
@@ -279,9 +302,9 @@ private fun fmtDur(ms: Long): String {
 private fun Label(t: String) = Text(t, fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = Color(0xFFB9BBC4))
 
 @Composable
-private fun <T> Chips(items: List<T>, selected: T, label: (T) -> String, onPick: (T) -> Unit) {
+private fun <T> Chips(items: List<T>, selected: T, label: (T) -> String, enabled: (T) -> Boolean = { true }, onPick: (T) -> Unit) {
     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-        items.forEach { FilterChip(selected = it == selected, onClick = { onPick(it) }, label = { Text(label(it)) }) }
+        items.forEach { FilterChip(selected = it == selected, enabled = enabled(it), onClick = { onPick(it) }, label = { Text(label(it)) }) }
     }
 }
 
@@ -289,7 +312,7 @@ private fun <T> Chips(items: List<T>, selected: T, label: (T) -> String, onPick:
 private fun SwitchRow(title: String, sub: String, checked: Boolean, onChange: (Boolean) -> Unit) {
     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
         Column(Modifier.weight(1f)) {
-            Text(title, fontSize = 15.sp)
+            Text(title, fontSize = 15.sp, color = Color(0xFFF2F2F5))
             Text(sub, fontSize = 12.sp, color = Color(0xFF9A9CA6))
         }
         Switch(checked = checked, onCheckedChange = onChange)
