@@ -66,18 +66,18 @@ object Recordings {
 
 /** Remembers each recording's read-back verification so the list can show it without re-reading files. */
 object VerifyStore {
-    data class Verdict(val summary: String, val ok: Boolean, val note: String)
+    data class Verdict(val summary: String, val ok: Boolean, val note: String, val info: String = "")
 
     private fun prefs(c: Context) = c.getSharedPreferences("verify", Context.MODE_PRIVATE)
 
     fun put(c: Context, name: String, v: Verdict) {
-        prefs(c).edit().putString(name, "${if (v.ok) 1 else 0}\n${v.summary}\n${v.note}").apply()
+        prefs(c).edit().putString(name, "${if (v.ok) 1 else 0}\n${v.summary}\n${v.note}\n${v.info}").apply()
     }
 
     fun get(c: Context, name: String): Verdict? {
-        val parts = prefs(c).getString(name, null)?.split("\n", limit = 3) ?: return null
+        val parts = prefs(c).getString(name, null)?.split("\n", limit = 4) ?: return null
         if (parts.size < 3) return null
-        return Verdict(parts[1], parts[0] == "1", parts[2])
+        return Verdict(parts[1], parts[0] == "1", parts[2], parts.getOrElse(3) { "" })
     }
 
     fun remove(c: Context, name: String) = prefs(c).edit().remove(name).apply()

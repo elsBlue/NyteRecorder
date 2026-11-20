@@ -97,6 +97,7 @@ class RecordingEngine(
     private var aMetrics = ""
     private var videoFormatLines = ""
     private var usedMode = "n/a"
+    private var repeatUsed = "n/a"
     private var audioWanted = false
 
     private val stopped = AtomicBoolean(false)
@@ -295,7 +296,7 @@ class RecordingEngine(
 
         // Tuned config. Deliberately NO KEY_PRIORITY(realtime) / KEY_LATENCY(low-latency): they can push the
         // Unisoc Codec2 encoder into modes that hurt quality/steadiness and aren't needed for file recording.
-        fun format(full: Boolean, fps: Int, mode: Int): MediaFormat = MediaFormat.createVideoFormat(p.mime, p.width, p.height).apply {
+        fun format(full: Boolean, fps: Int, mode: Int, repeat: Boolean): MediaFormat = MediaFormat.createVideoFormat(p.mime, p.width, p.height).apply {
             setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
             setInteger(MediaFormat.KEY_BIT_RATE, p.bitrate)
             setInteger(MediaFormat.KEY_FRAME_RATE, fps)
@@ -305,6 +306,9 @@ class RecordingEngine(
                 setInteger(MediaFormat.KEY_OPERATING_RATE, fps)
                 // Cap frames before the encoder so the output is a steady <= fps (e.g. 60/120 Hz game -> 30).
                 setFloat("max-fps-to-encoder", fps.toFloat())
+                // Constant-ish frame rate: when the screen is static, resubmit the last frame after one frame
+                // interval (handled by the framework's surface-input path, no extra work for the game).
+                if (repeat) setLong(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, 1_000_000L / fps)
                 setInteger(
                     MediaFormat.KEY_PROFILE,
                     if (p.mime == Codec.AVC.mime) MediaCodecInfo.CodecProfileLevel.AVCProfileHigh else MediaCodecInfo.CodecProfileLevel.HEVCProfileMain,
@@ -313,17 +317,18 @@ class RecordingEngine(
         }
 
         // Try: tuned with CBR (if supported) -> tuned with VBR -> basic -> (only then, if >30) basic at 30 fps.
-        class Attempt(val full: Boolean, val fps: Int, val mode: Int)
+        class Attempt(val full: Boolean, val fps: Int, val mode: Int, val repeat: Boolean = true)
         val attempts = ArrayList<Attempt>()
         if (p.bitrateMode == MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR) attempts += Attempt(true, p.fps, p.bitrateMode)
         attempts += Attempt(true, p.fps, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR)
+        attempts += Attempt(true, p.fps, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR, repeat = false)
         attempts += Attempt(false, p.fps, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR)
         if (p.fps > 30) attempts += Attempt(false, 30, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR)
         var lastErr: Exception? = null
         var n = 0
         for (at in attempts) {
             n++
-            val fmt = format(at.full, at.fps, at.mode)
+            val fmt = format(at.full, at.fps, at.mode, at.repeat)
             log.line("encoder attempt #$n (${if (at.full) "tuned, mode=${modeName(at.mode)}" else "basic (encoder default mode)"}, ${at.fps}fps): configure $fmt")
             val enc = create()
             try {
@@ -336,7 +341,9 @@ class RecordingEngine(
                 if (!at.full) note("Encoder rejected some tuning options, using basic config.")
                 else if (at.mode != p.bitrateMode) note("CBR rejected by the encoder; using VBR (actual bitrate may undershoot the selected value).")
                 if (at.fps != p.fps) note("Encoder refused ${p.fps} fps at ${p.width}x${p.height}; recording at ${at.fps} fps.")
-                log.line("encoder attempt #$n OK: ${enc.name}; bitrate mode used: $usedMode")
+                repeatUsed = if (at.full && at.repeat) "${1_000_000L / at.fps} us (accepted by configure; applied by the framework's surface-input path)" else "off"
+                if (at.full && !at.repeat) note("Encoder rejected repeat-previous-frame; output frame rate follows screen changes (variable).")
+                log.line("encoder attempt #$n OK: ${enc.name}; bitrate mode used: $usedMode; repeat-previous-frame-after: $repeatUsed")
                 videoFormatLines = "configured: $fmt\naccepted (inputFormat): ${runCatching { enc.inputFormat }.getOrNull()}"
                 log.raw("  accepted inputFormat: ${runCatching { enc.inputFormat }.getOrNull()}")
                 Log.i(TAG, "Video encoder ${enc.name} ${p.width}x${p.height}@${at.fps} ${p.bitrate / 1000}kbps mode=$usedMode")
@@ -734,6 +741,7 @@ class RecordingEngine(
         if (armedAtMs >= 0) sum.raw("Waited for landscape: ${if (waitedMs >= 0) "$waitedMs ms" else "never reached landscape"}")
         if (recStartMs >= 0) sum.raw("Wall-clock recording duration: ${(stopAtMs - recStartMs) / 1000.0} s")
         sum.raw("Bitrate mode used: $usedMode")
+        sum.raw("Repeat-previous-frame-after: $repeatUsed")
         sum.raw("Thermal/battery at start: ${batteryStart.ifEmpty { "n/a" }}")
         sum.raw("Thermal/battery at end:   $endState")
         sum.raw("Max battery temp seen: ${if (maxBatteryC.isNaN()) "n/a" else "%.1f C".format(Locale.US, maxBatteryC)}")
@@ -812,6 +820,8 @@ class RecordingEngine(
             var videoKbps = Double.NaN
             var audioDesc: String? = null
             var audioKbps = Double.NaN
+            var vFirstMs = Double.NaN
+            var aFirstMs = Double.NaN
             for (t in 0 until ex.trackCount) {
                 val f = ex.getTrackFormat(t)
                 val mime = f.getString(MediaFormat.KEY_MIME) ?: continue
@@ -832,35 +842,48 @@ class RecordingEngine(
                 val fps = if (count > 1) (count - 1) * 1_000_000.0 / span else 0.0
                 val kbps = bytes * 8 * 1000.0 / span
                 out.raw("Track $t $mime: samples=$count first=${ms(first)} ms span=${ms(span)} ms avg rate=${"%.2f".format(Locale.US, fps)}/s min interval=${if (minIv == Long.MAX_VALUE) "n/a" else ms(minIv)} ms max interval=${ms(maxIv)} ms bitrate=${"%.0f".format(Locale.US, kbps)} kbps | $f")
-                if (mime.startsWith("video/")) { videoFps = fps; videoKbps = kbps }
+                if (mime.startsWith("video/")) { videoFps = fps; videoKbps = kbps; vFirstMs = first / 1000.0 }
                 if (mime.startsWith("audio/")) {
                     audioKbps = kbps
+                    aFirstMs = first / 1000.0
                     audioDesc = "AAC ${f.getInteger(MediaFormat.KEY_SAMPLE_RATE) / 1000.0} kHz ${f.getInteger(MediaFormat.KEY_CHANNEL_COUNT)}ch ${"%.0f".format(Locale.US, kbps)} kbps"
                 }
             }
             ex.release()
 
+            if (!vFirstMs.isNaN() && !aFirstMs.isNaN()) {
+                out.raw("A/V start in file: video first sample at ${"%.1f".format(Locale.US, vFirstMs)} ms, audio at ${"%.1f".format(Locale.US, aFirstMs)} ms (audio ${"%.1f".format(Locale.US, aFirstMs - vFirstMs)} ms after video).")
+                out.raw("  Both tracks use real capture times on one monotonic clock, so this offset is the true gap before audio capture delivered its first")
+                out.raw("  sample; MP4 start offsets keep them in sync (no drift, only that many ms of silence at the start).")
+            }
             val size = ctx.contentResolver.openFileDescriptor(u, "r")?.use { it.statSize } ?: -1L
             out.raw("File size: $size bytes")
             val problems = ArrayList<String>()
+            var info = ""
             if (p != null) {
                 val sizeOk = w == p.width && h == p.height
                 if (!sizeOk) problems += "size ${w}x$h, selected ${p.width}x${p.height}"
                 val fpsOk = !videoFps.isNaN() && videoFps >= effFps * 0.9
                 if (!fpsOk && !videoFps.isNaN()) problems += "avg ${"%.1f".format(Locale.US, videoFps)} fps vs $effFps selected (idle screen content also lowers this)"
                 val selKbps = p.bitrate / 1000.0
-                val brOk = !videoKbps.isNaN() && videoKbps in selKbps * 0.8..selKbps * 1.2
-                if (!brOk && !videoKbps.isNaN()) problems += "video ${"%.1f".format(Locale.US, videoKbps / 1000)} Mbps vs ${"%.0f".format(Locale.US, selKbps / 1000)} Mbps selected ($usedMode)"
+                val isCbr = usedMode == "CBR"
+                // CBR: expect ~selected (+-20%). VBR: undershoot on easy content is normal (informational);
+                // only flag overshoot >25% or an extreme undershoot (<10%).
+                val brOk = videoKbps.isNaN() || if (isCbr) videoKbps in selKbps * 0.8..selKbps * 1.2 else videoKbps in selKbps * 0.10..selKbps * 1.25
+                if (!brOk) problems += "video ${"%.1f".format(Locale.US, videoKbps / 1000)} Mbps vs ${"%.0f".format(Locale.US, selKbps / 1000)} Mbps selected ($usedMode)"
+                if (!isCbr && !videoKbps.isNaN() && videoKbps < selKbps * 0.8 && brOk) {
+                    info = "VBR: ${"%.1f".format(Locale.US, videoKbps / 1000)} Mbps used of ${"%.0f".format(Locale.US, selKbps / 1000)} selected; the encoder saved space on simple content."
+                }
                 if (audioWanted && audioDesc == null) problems += "no audio track"
                 out.raw("Selected vs actual:")
                 out.raw("  size:    selected ${p.width}x${p.height}, actual ${w}x$h -> ${if (sizeOk) "OK" else "MISMATCH"}")
                 out.raw("  fps:     selected $effFps, actual average ${"%.2f".format(Locale.US, videoFps)} -> ${if (fpsOk) "OK" else "BELOW TARGET"}")
-                out.raw("  bitrate: selected video ${p.bitrate / 1000} kbps ($usedMode), actual video ${"%.0f".format(Locale.US, videoKbps)} kbps -> ${if (brOk) "OK (within 20%)" else "OFF TARGET"}")
+                out.raw("  bitrate: selected video ${p.bitrate / 1000} kbps ($usedMode), actual video ${"%.0f".format(Locale.US, videoKbps)} kbps -> ${if (!brOk) "OFF TARGET" else if (info.isNotEmpty()) "OK (VBR undershoot, informational)" else "OK"}")
                 out.raw("  audio:   ${audioDesc ?: "none"} (wanted=$audioWanted)")
             }
             return VerifyStore.Verdict(
                 "${w ?: "?"}×${h ?: "?"} · ${"%.1f".format(Locale.US, videoFps)} fps · ${"%.1f".format(Locale.US, videoKbps / 1000)} Mbps · ${audioDesc ?: "no audio"}",
-                problems.isEmpty(), problems.joinToString("; "),
+                problems.isEmpty(), problems.joinToString("; "), info,
             )
         } catch (e: Throwable) {
             out.raw("Verification failed: ${e.javaClass.simpleName}: ${e.message}")

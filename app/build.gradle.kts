@@ -12,8 +12,9 @@ android {
         applicationId = "com.nytefall.nyterecorder"
         minSdk = 29 // AudioPlaybackCapture needs API 29+
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0"
+        // versionCode follows the CI run number (always increasing); local fallback 2.
+        versionCode = System.getenv("GITHUB_RUN_NUMBER")?.toIntOrNull() ?: 2
+        versionName = "1.1"
     }
 
     buildTypes {

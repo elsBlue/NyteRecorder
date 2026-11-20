@@ -168,6 +168,28 @@ private fun Screen() {
         else requestProjection()
     }
 
+    var askOrient by remember { mutableStateOf(false) }
+    fun onStartClicked() {
+        // Auto + portrait screen at Start would record a portrait frame, but games are landscape.
+        if (s.orient == Orient.AUTO && !CodecSupport.nativeDisplay(ctx).landscape) askOrient = true else onStart()
+    }
+    if (askOrient) {
+        androidx.compose.material3.AlertDialog(
+            onDismissRequest = { askOrient = false },
+            containerColor = Color(0xFF232630),
+            titleContentColor = Color(0xFFF2F2F5),
+            textContentColor = Color(0xFFE0E0E6),
+            title = { Text("Recording portrait") },
+            text = { Text("The screen is portrait right now, so the video would be portrait. Games are landscape: switch to Landscape so the game fills the frame? Recording then starts automatically when the screen turns landscape.") },
+            confirmButton = {
+                TextButton({ askOrient = false; update(s.copy(orient = Orient.LANDSCAPE)); onStart() }) { Text("Landscape (wait)", color = Color(0xFFFF6B75)) }
+            },
+            dismissButton = {
+                TextButton({ askOrient = false; onStart() }) { Text("Keep portrait", color = Color(0xFFE0E0E6)) }
+            },
+        )
+    }
+
     fun batteryExempt(): Boolean = ctx.getSystemService(PowerManager::class.java).isIgnoringBatteryOptimizations(ctx.packageName)
     var battery by remember { mutableStateOf(batteryExempt()) }
 
@@ -183,7 +205,7 @@ private fun Screen() {
             }
             item {
                 Button(
-                    onClick = { if (recording) ctx.startService(RecorderService.stopIntent(ctx)) else onStart() },
+                    onClick = { if (recording) ctx.startService(RecorderService.stopIntent(ctx)) else onStartClicked() },
                     modifier = Modifier.fillMaxWidth().height(72.dp),
                     shape = RoundedCornerShape(20.dp),
                     colors = ButtonDefaults.buttonColors(containerColor = if (recording) Color(0xFF3A3D47) else Color(0xFFFF3B47)),
@@ -274,6 +296,7 @@ private fun Screen() {
                     if (v != null) {
                         Text("${if (v.ok) "✓" else "⚠"} ${v.summary}", fontSize = 12.sp, color = if (v.ok) Color(0xFF66D17A) else Color(0xFFFFB74D))
                         if (!v.ok) Text("Doesn't match settings: ${v.note}", fontSize = 12.sp, color = Color(0xFFFFB74D))
+                        if (v.info.isNotEmpty()) Text(v.info, fontSize = 12.sp, color = Color(0xFF9A9CA6))
                     }
                     Row {
                         TextButton({ Recordings.play(ctx, r) }) { Text("Play") }
