@@ -55,7 +55,7 @@ class RecorderService : Service() {
         createChannel()
         var type = ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
         if (micOk) type = type or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
-        startForeground(NOTIF_ID, buildNotification(SystemClock.elapsedRealtime()), type)
+        startForeground(NOTIF_ID, buildNotification(null), type)
 
         val code = intent.getIntExtra(EXTRA_RESULT_CODE, 0)
         @Suppress("DEPRECATION")
@@ -74,18 +74,27 @@ class RecorderService : Service() {
 
         val eng = RecordingEngine(applicationContext, projection, settings) { uri, error -> main.post { onFinished(uri != null, error) } }
         engine = eng
+        RecorderState.message.value = null
+        RecorderState.recording.value = true
         try {
-            eng.start()
+            eng.begin { onRecordingStarted(eng, settings) }
         } catch (e: Exception) {
-            eng.stop() // cleans up, then reports through onFinished
             RecorderState.message.value = "Could not start: ${e.message ?: e.javaClass.simpleName}"
+            eng.stop() // cleans up, then reports through onFinished
             return
         }
+        if (eng.waiting) {
+            RecorderState.waiting.value = true
+            RecorderState.message.value = "Waiting for landscape: open your game or rotate the phone. Recording starts automatically."
+            getSystemService(NotificationManager::class.java).notify(NOTIF_ID, buildNotification(null))
+        }
+    }
+
+    private fun onRecordingStarted(eng: RecordingEngine, settings: RecSettings) {
         val startedAt = SystemClock.elapsedRealtime()
         RecorderState.startedAt.value = startedAt
-        RecorderState.recording.value = true
-        val notes = eng.notes
-        RecorderState.message.value = if (notes.isEmpty()) null else notes.joinToString(" ")
+        RecorderState.waiting.value = false
+        RecorderState.message.value = if (eng.notes.isEmpty()) null else eng.notes.joinToString(" ")
         getSystemService(NotificationManager::class.java).notify(NOTIF_ID, buildNotification(startedAt))
         if (settings.overlay && android.provider.Settings.canDrawOverlays(this)) {
             bubble = OverlayBubble(this, startedAt) { eng.stop() }.also { it.show() }
@@ -100,10 +109,14 @@ class RecorderService : Service() {
 
     private fun onFinished(saved: Boolean, error: String?) {
         bubble?.hide(); bubble = null
+        val wasWaiting = RecorderState.waiting.value
         RecorderState.recording.value = false
+        RecorderState.waiting.value = false
         RecorderState.savedCount.value += 1
         if (saved) Toast.makeText(this, "Saved to Movies/NyteRecorder", Toast.LENGTH_SHORT).show()
-        if (error != null && RecorderState.message.value == null) RecorderState.message.value = error
+        if (error != null) {
+            if (error != "Nothing was recorded." || RecorderState.message.value == null) RecorderState.message.value = error
+        } else if (wasWaiting) RecorderState.message.value = null
         engine = null
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
@@ -116,15 +129,15 @@ class RecorderService : Service() {
         }
     }
 
-    private fun buildNotification(since: Long): Notification {
+    private fun buildNotification(since: Long?): Notification {
         val open = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
         val stop = PendingIntent.getService(this, 1, stopIntent(this), PendingIntent.FLAG_IMMUTABLE)
-        return Notification.Builder(this, CHANNEL)
+        val b = Notification.Builder(this, CHANNEL)
             .setSmallIcon(R.drawable.ic_stat_rec)
-            .setContentTitle("Recording screen")
-            .setContentText("Tap Stop to finish")
-            .setUsesChronometer(true)
-            .setWhen(System.currentTimeMillis() - (SystemClock.elapsedRealtime() - since))
+            .setContentTitle(if (since == null) "Waiting for landscape" else "Recording screen")
+            .setContentText(if (since == null) "Starts when the screen turns landscape" else "Tap Stop to finish")
+        if (since != null) b.setUsesChronometer(true).setWhen(System.currentTimeMillis() - (SystemClock.elapsedRealtime() - since))
+        return b
             .setOngoing(true)
             .setContentIntent(open)
             .addAction(Notification.Action.Builder(null, "Stop", stop).build())

@@ -22,7 +22,7 @@ Other options: Native 2408x1080, 720p, 30 fps, 8/16 Mbps, H.265 (only if a hardw
 ## Known limitations
 - Apps that opt out of capture (`allowAudioPlaybackCapture=false`) or use `USAGE` types outside media/game/unknown are silent.
 - The optional bubble and the notification shade are visible in the video (they are part of the screen).
-- Orientation is fixed when recording starts.
+- The video canvas size is fixed when recording starts. In Landscape mode recording waits until the screen is landscape; if you go back to portrait mid-recording, the portrait screen is pillarboxed (as the system scales it to fit).
 
 ## Build
 GitHub Actions builds the debug APK on every push (artifact `nyterecorder-debug-apk`, also the `ci-latest` pre-release).

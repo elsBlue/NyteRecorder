@@ -52,14 +52,14 @@ object CodecSupport {
         val fps: Int,
         val bitrate: Int,
         val notes: List<String>,
+        val maxFps: Double? = null, // what the encoder itself reports for this exact size
+        val alignment: Int = 16,
+        val fpsForced: Boolean = false, // requested fps not in the declared range, but we try it anyway
     ) {
         val hardware get() = codecName != null
     }
 
-    private fun align(v: Double, a: Int): Int {
-        val al = max(a, 2)
-        return max(al, ((v / al).roundToInt()) * al)
-    }
+    private fun align(v: Double, a: Int): Int = max(a, (v / a).roundToInt() * a)
 
     fun outputSize(res: Res, nLong: Int, nShort: Int): Pair<Double, Double> {
         val scale = when (res) {
@@ -68,6 +68,13 @@ object CodecSupport {
             Res.P720 -> min(1.0, 1280.0 / nLong)
         }
         return nLong * scale to nShort * scale
+    }
+
+    /** Orientation actually used for the canvas. */
+    fun isLandscape(s: RecSettings, nd: NativeDisplay): Boolean = when (s.orient) {
+        Orient.LANDSCAPE -> true
+        Orient.PORTRAIT -> false
+        Orient.AUTO -> nd.landscape
     }
 
     fun plan(ctx: Context, s: RecSettings): Plan {
@@ -82,37 +89,49 @@ object CodecSupport {
         }
         if (info == null) notes += "No hardware ${codec.label} encoder found; using the system default (may use CPU)."
 
-        val landscape = when (s.orient) {
-            Orient.LANDSCAPE -> true
-            Orient.PORTRAIT -> false
-            Orient.AUTO -> nd.landscape
-        }
+        val landscape = isLandscape(s, nd)
         val (l, sh) = outputSize(s.res, nd.long, nd.short)
-        var w = if (landscape) l else sh
-        var h = if (landscape) sh else l
+        val outW = if (landscape) l else sh
+        val outH = if (landscape) sh else l
+        val aspect = outW / outH
 
-        var fps = s.fps
+        val fps = s.fps
         var bitrate = s.bitrateMbps * 1_000_000
         val caps = info?.getCapabilitiesForType(codec.mime)?.videoCapabilities
-        var aw = 2; var ah = 2
-        if (caps != null) {
-            aw = caps.widthAlignment; ah = caps.heightAlignment
-            var wi = align(w, aw); var hi = align(h, ah)
-            var tries = 0
-            while (!caps.isSizeSupported(wi, hi) && tries < 4) {
-                w *= 0.85; h *= 0.85
-                wi = align(w, aw); hi = align(h, ah)
-                notes += "Size not supported, reduced to ${wi}x$hi."
-                tries++
-            }
-            w = wi.toDouble(); h = hi.toDouble()
-            if (!caps.areSizeAndRateSupported(wi, hi, fps.toDouble())) {
-                val maxFps = runCatching { caps.getSupportedFrameRatesFor(wi, hi).upper.toInt() }.getOrDefault(30)
-                notes += "$fps fps not supported at ${wi}x$hi, using ${min(maxFps, 30)} fps."
-                fps = min(maxFps, 30)
-            }
-            bitrate = bitrate.coerceIn(caps.bitrateRange.lower, caps.bitrateRange.upper)
+        // Hardware encoders want macroblock-aligned sizes (1920x862 is rejected for 60 fps on the Unisoc one).
+        val a = if (caps != null) max(16, max(caps.widthAlignment, caps.heightAlignment)) else 16
+        val firstW = align(outW, a)
+        val firstH = align(outH, a)
+
+        if (caps == null) return Plan(info?.name, codec.mime, firstW, firstH, nd.dpi, fps, bitrate, notes, alignment = a)
+
+        bitrate = bitrate.coerceIn(caps.bitrateRange.lower, caps.bitrateRange.upper)
+        fun rateAt(w: Int, h: Int): Double? = runCatching { caps.getSupportedFrameRatesFor(w, h).upper }.getOrNull()
+
+        // Candidates: the ideal aligned size first, then slightly narrower 16-aligned sizes with nearly the same aspect.
+        val candidates = ArrayList<Pair<Int, Int>>()
+        candidates += firstW to firstH
+        var w = firstW - a
+        while (w >= firstW * 0.85) {
+            candidates += w to align(w / aspect, a)
+            w -= a
         }
-        return Plan(info?.name, codec.mime, align(w, aw), align(h, ah), nd.dpi, fps, bitrate, notes)
+        val supported = candidates.filter { (cw, ch) -> caps.isSizeSupported(cw, ch) }
+        val withRate = supported.firstOrNull { (cw, ch) -> caps.areSizeAndRateSupported(cw, ch, fps.toDouble()) }
+
+        val chosen: Pair<Int, Int>
+        var forced = false
+        if (withRate != null) {
+            chosen = withRate
+            if (chosen != candidates[0]) notes += "${candidates[0].first}x${candidates[0].second} can't do $fps fps on this encoder; using ${chosen.first}x${chosen.second} to keep $fps fps."
+        } else if (supported.isNotEmpty()) {
+            chosen = supported[0]
+            forced = fps > 30
+            if (forced) notes += "Encoder reports max ${rateAt(chosen.first, chosen.second)?.toInt() ?: "?"} fps at ${chosen.first}x${chosen.second}; trying $fps fps anyway."
+        } else {
+            chosen = candidates[0]
+            notes += "Encoder reports ${candidates[0].first}x${candidates[0].second} unsupported; trying anyway."
+        }
+        return Plan(info?.name, codec.mime, chosen.first, chosen.second, nd.dpi, fps, bitrate, notes, rateAt(chosen.first, chosen.second), a, forced)
     }
 }

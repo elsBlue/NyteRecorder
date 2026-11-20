@@ -4,6 +4,7 @@ import android.content.ContentValues
 import android.content.Context
 import android.content.pm.PackageManager
 import android.hardware.display.DisplayManager
+import android.view.Display
 import android.hardware.display.VirtualDisplay
 import android.media.AudioAttributes
 import android.media.AudioFormat
@@ -72,7 +73,52 @@ class RecordingEngine(
 
     var plan: CodecSupport.Plan? = null
         private set
+    private var effFps = 60
+    private var startError: String? = null
+    private var displayListener: DisplayManager.DisplayListener? = null
+    @Volatile var waiting = false
+        private set
     val notes = ArrayList<String>()
+
+    /**
+     * Starts now, or - when the canvas must be landscape but the screen is currently portrait - arms
+     * and waits (cheaply, via a DisplayListener) until the screen becomes landscape. That way the
+     * recording never begins with a portrait screen squeezed into a landscape frame.
+     */
+    fun begin(onStarted: () -> Unit) {
+        val needLandscape = settings.orient == Orient.LANDSCAPE
+        val dm = ctx.getSystemService(DisplayManager::class.java)
+        if (!needLandscape || CodecSupport.nativeDisplay(ctx).landscape) {
+            start()
+            onStarted()
+            return
+        }
+        waiting = true
+        val l = object : DisplayManager.DisplayListener {
+            override fun onDisplayAdded(displayId: Int) {}
+            override fun onDisplayRemoved(displayId: Int) {}
+            override fun onDisplayChanged(displayId: Int) {
+                if (displayId != Display.DEFAULT_DISPLAY || stopped.get() || !waiting) return
+                if (!CodecSupport.nativeDisplay(ctx).landscape) return
+                waiting = false
+                dm.unregisterDisplayListener(this)
+                displayListener = null
+                try {
+                    start()
+                    onStarted()
+                } catch (e: Exception) {
+                    startError = "Could not start: ${e.message ?: e.javaClass.simpleName}"
+                    stop()
+                }
+            }
+        }
+        displayListener = l
+        dm.registerDisplayListener(l, Handler(Looper.getMainLooper()))
+        // Needed on Android 14+ before a projection can sit idle; harmless earlier.
+        projection.registerCallback(object : MediaProjection.Callback() {
+            override fun onStop() { stop() }
+        }, Handler(Looper.getMainLooper()))
+    }
 
     /** Sets everything up and starts recording. Throws on a fatal error (caller cleans up via [stop]). */
     fun start() {
@@ -123,39 +169,49 @@ class RecordingEngine(
     private fun setupVideoEncoder(p: CodecSupport.Plan) {
         fun create(): MediaCodec = if (p.codecName != null) MediaCodec.createByCodecName(p.codecName) else MediaCodec.createEncoderByType(p.mime)
 
-        fun format(full: Boolean): MediaFormat = MediaFormat.createVideoFormat(p.mime, p.width, p.height).apply {
+        fun format(full: Boolean, fps: Int): MediaFormat = MediaFormat.createVideoFormat(p.mime, p.width, p.height).apply {
             setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
             setInteger(MediaFormat.KEY_BIT_RATE, p.bitrate)
-            setInteger(MediaFormat.KEY_FRAME_RATE, p.fps)
+            setInteger(MediaFormat.KEY_FRAME_RATE, fps)
             setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2)
             if (full) {
                 setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR)
                 setInteger(MediaFormat.KEY_PRIORITY, 0) // realtime
                 setInteger(MediaFormat.KEY_LATENCY, 1) // low latency
                 // If the display runs faster than the target (e.g. a 120 Hz game), drop frames before the encoder.
-                setFloat("max-fps-to-encoder", p.fps.toFloat())
-                if (p.mime == Codec.AVC.mime) {
-                    setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.AVCProfileHigh)
-                } else {
-                    setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.HEVCProfileMain)
-                }
+                setFloat("max-fps-to-encoder", fps.toFloat())
+                setInteger(
+                    MediaFormat.KEY_PROFILE,
+                    if (p.mime == Codec.AVC.mime) MediaCodecInfo.CodecProfileLevel.AVCProfileHigh else MediaCodecInfo.CodecProfileLevel.HEVCProfileMain,
+                )
             }
         }
 
-        var enc = create()
-        try {
-            enc.configure(format(true), null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-        } catch (e: Exception) {
-            Log.w(TAG, "Full encoder config rejected, retrying with basic config", e)
-            notes += "Encoder rejected some tuning options, using basic config."
-            try { enc.release() } catch (_: Throwable) {}
-            enc = create()
-            enc.configure(format(false), null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+        // Try: full tuning at requested fps -> basic config at requested fps -> (only then) 30 fps.
+        val attempts = ArrayList<Pair<Boolean, Int>>()
+        attempts += true to p.fps
+        attempts += false to p.fps
+        if (p.fps > 30) attempts += false to 30
+        var lastErr: Exception? = null
+        for ((full, fps) in attempts) {
+            val enc = create()
+            try {
+                enc.configure(format(full, fps), null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+                surface = enc.createInputSurface()
+                enc.start()
+                venc = enc
+                effFps = fps
+                if (!full) notes += "Encoder rejected some tuning options, using basic config."
+                if (fps != p.fps) notes += "Encoder refused ${p.fps} fps at ${p.width}x${p.height}; recording at $fps fps."
+                Log.i(TAG, "Video encoder ${enc.name} ${p.width}x${p.height}@$fps ${p.bitrate / 1000}kbps full=$full")
+                return
+            } catch (e: Exception) {
+                Log.w(TAG, "Encoder config failed (full=$full fps=$fps)", e)
+                lastErr = e
+                try { enc.release() } catch (_: Throwable) {}
+            }
         }
-        surface = enc.createInputSurface()
-        enc.start()
-        venc = enc
-        Log.i(TAG, "Video encoder ${enc.name} ${p.width}x${p.height}@${p.fps} ${p.bitrate / 1000}kbps")
+        throw lastErr ?: IllegalStateException("Encoder setup failed")
     }
 
     private fun videoLoop() {
@@ -390,7 +446,12 @@ class RecordingEngine(
     }
 
     private fun finalizeAll() {
-        var error: String? = null
+        var error: String? = startError
+        displayListener?.let { l ->
+            try { ctx.getSystemService(DisplayManager::class.java).unregisterDisplayListener(l) } catch (_: Throwable) {}
+            displayListener = null
+        }
+        waiting = false
         try { vdisplay?.release() } catch (_: Throwable) {}
         try { callback?.let { projection.unregisterCallback(it) } } catch (_: Throwable) {}
         try { projection.stop() } catch (_: Throwable) {}

@@ -26,9 +26,11 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.safeDrawing
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -64,7 +66,8 @@ import java.util.Date
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        WindowCompat.setDecorFitsSystemWindows(window, false)
+        // Let the system lay out around the status/navigation bars so nothing is clipped.
+        WindowCompat.setDecorFitsSystemWindows(window, true)
         setContent {
             MaterialTheme(
                 colorScheme = darkColorScheme(
@@ -88,6 +91,7 @@ private fun Screen() {
     fun update(n: RecSettings) { s = n; SettingsStore.save(ctx, n) }
 
     val recording by RecorderState.recording.collectAsState()
+    val waiting by RecorderState.waiting.collectAsState()
     val message by RecorderState.message.collectAsState()
     val saved by RecorderState.savedCount.collectAsState()
     val recs = remember { mutableStateListOf<Rec>() }
@@ -157,11 +161,11 @@ private fun Screen() {
 
     Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
         LazyColumn(
-            Modifier.fillMaxSize().statusBarsPadding().navigationBarsPadding().padding(horizontal = 18.dp),
+            Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing).padding(horizontal = 18.dp),
+            contentPadding = PaddingValues(top = 12.dp, bottom = 28.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
             item {
-                Spacer(Modifier.height(10.dp))
                 Text("Nyte Recorder", fontSize = 26.sp, fontWeight = FontWeight.Bold)
                 Text("Internal audio · hardware encoder · built for gaming", fontSize = 13.sp, color = Color(0xFF9A9CA6))
             }
@@ -171,7 +175,7 @@ private fun Screen() {
                     modifier = Modifier.fillMaxWidth().height(72.dp),
                     shape = RoundedCornerShape(20.dp),
                     colors = ButtonDefaults.buttonColors(containerColor = if (recording) Color(0xFF3A3D47) else Color(0xFFFF3B47)),
-                ) { Text(if (recording) "Stop recording" else "Start recording", fontSize = 20.sp, fontWeight = FontWeight.SemiBold) }
+                ) { Text(if (waiting) "Cancel (waiting for landscape)" else if (recording) "Stop recording" else "Start recording", fontSize = 20.sp, fontWeight = FontWeight.SemiBold) }
             }
             if (message != null) item { Text(message!!, color = Color(0xFFFFB74D), fontSize = 13.sp) }
 
@@ -200,7 +204,7 @@ private fun Screen() {
             item {
                 Chips(Orient.entries, s.orient, { it.label }) { update(s.copy(orient = it)) }
                 Text(
-                    "Landscape is fixed at start, so games always fill the frame. Auto follows the screen at the moment you press Start.",
+                    "Landscape: the frame is always landscape and recording begins once the screen is landscape (open your game), so content fills the frame. Auto: frame matches the screen when you press Start. Portrait: always portrait.",
                     fontSize = 12.sp, color = Color(0xFF9A9CA6),
                 )
             }
@@ -220,6 +224,7 @@ private fun Screen() {
                     if (p != null) {
                         Text("${p.width}×${p.height} @ ${p.fps} fps · ${p.bitrate / 1_000_000} Mbps · ${if (p.mime == Codec.AVC.mime) "H.264" else "H.265"}", fontSize = 13.sp)
                         Text("Encoder: ${p.codecName ?: "none (hardware not found)"}", fontSize = 12.sp, color = Color(0xFF9A9CA6))
+                        if (p.maxFps != null) Text("Encoder reports up to ${p.maxFps.toInt()} fps at this size (${p.alignment}px aligned)", fontSize = 12.sp, color = Color(0xFF9A9CA6))
                         p.notes.forEach { Text(it, fontSize = 12.sp, color = Color(0xFFFFB74D)) }
                     }
                     Text("Audio: AAC-LC 48 kHz stereo 192 kbps", fontSize = 12.sp, color = Color(0xFF9A9CA6))
