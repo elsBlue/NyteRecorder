@@ -1,0 +1,61 @@
+name: Android Build
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Install SDK packages
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platforms;android-36" "build-tools;35.0.0"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Pre-download Gradle distribution with retries
+        run: |
+          chmod +x ./gradlew
+          curl -fL --retry 10 --retry-all-errors --retry-delay 15 -o /tmp/gradle-8.11.1-bin.zip https://services.gradle.org/distributions/gradle-8.11.1-bin.zip
+          sed -i 's#^distributionUrl=.*#distributionUrl=file:///tmp/gradle-8.11.1-bin.zip#' gradle/wrapper/gradle-wrapper.properties
+
+      - name: Build debug APK
+        run: ./gradlew assembleDebug --stacktrace --no-daemon
+
+      - name: Upload debug APK
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: nyterecorder-debug-apk
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+
+      # Also publish the APK to a rolling pre-release (in case the Actions artifact quota is hit).
+      - name: Publish to ci-latest pre-release
+        if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p dist
+          cp app/build/outputs/apk/debug/app-debug.apk dist/NyteRecorder-debug.apk
+          gh release delete ci-latest --yes --cleanup-tag || true
+          gh release create ci-latest dist/* --prerelease --target "$GITHUB_SHA" \
+            --title "CI build ${GITHUB_SHA::7}" --notes "Debug build from commit $GITHUB_SHA (run $GITHUB_RUN_ID)."

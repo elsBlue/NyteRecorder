@@ -1,0 +1,48 @@
+package com.nytefall.nyterecorder
+
+import android.content.ContentUris
+import android.content.Context
+import android.content.Intent
+import android.net.Uri
+import android.provider.MediaStore
+
+data class Rec(val uri: Uri, val name: String, val size: Long, val dateSec: Long, val durationMs: Long)
+
+object Recordings {
+    fun list(ctx: Context, limit: Int = 30): List<Rec> {
+        val out = ArrayList<Rec>()
+        val proj = arrayOf(
+            MediaStore.Video.Media._ID, MediaStore.Video.Media.DISPLAY_NAME, MediaStore.Video.Media.SIZE,
+            MediaStore.Video.Media.DATE_ADDED, MediaStore.Video.Media.DURATION,
+        )
+        ctx.contentResolver.query(
+            MediaStore.Video.Media.EXTERNAL_CONTENT_URI, proj,
+            "${MediaStore.Video.Media.RELATIVE_PATH} LIKE ?", arrayOf("Movies/NyteRecorder%"),
+            "${MediaStore.Video.Media.DATE_ADDED} DESC",
+        )?.use { c ->
+            while (c.moveToNext() && out.size < limit) {
+                out += Rec(
+                    ContentUris.withAppendedId(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, c.getLong(0)),
+                    c.getString(1) ?: "recording.mp4", c.getLong(2), c.getLong(3), c.getLong(4),
+                )
+            }
+        }
+        return out
+    }
+
+    fun delete(ctx: Context, r: Rec): Boolean = try {
+        ctx.contentResolver.delete(r.uri, null, null) > 0
+    } catch (e: SecurityException) {
+        false
+    }
+
+    fun play(ctx: Context, r: Rec) {
+        val i = Intent(Intent.ACTION_VIEW).setDataAndType(r.uri, "video/mp4").addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+        runCatching { ctx.startActivity(i) }
+    }
+
+    fun share(ctx: Context, r: Rec) {
+        val i = Intent(Intent.ACTION_SEND).setType("video/mp4").putExtra(Intent.EXTRA_STREAM, r.uri).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        runCatching { ctx.startActivity(Intent.createChooser(i, "Share recording").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) }
+    }
+}
