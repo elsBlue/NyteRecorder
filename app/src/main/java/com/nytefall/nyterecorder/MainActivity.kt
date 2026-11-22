@@ -111,6 +111,7 @@ private fun Screen() {
     LaunchedEffect(s) { plan = CodecSupport.plan(ctx, s) }
     var fps60 by remember { mutableStateOf(true to (null as Int?)) }
     LaunchedEffect(s.res, s.codec, s.orient) {
+        // 60 fps stays enabled when some native-aspect size can do it; resolution is lowered at plan time.
         fps60 = CodecSupport.supports60(ctx, s)
         if (!fps60.first && s.fps > 30) update(s.copy(fps = 30))
     }
@@ -228,8 +229,21 @@ private fun Screen() {
             item { Label("Frame rate") }
             item {
                 Chips(listOf(30, 60), s.fps, { "$it fps" }, enabled = { it <= 30 || fps60.first }) { update(s.copy(fps = it)) }
-                if (!fps60.first) Text(
-                    "60 fps isn't supported by this phone's hardware encoder at this size (up to ${fps60.second ?: 30} fps).",
+                val p60 = plan
+                if (s.fps >= 60 && p60 != null) {
+                    if (p60.fps >= 60) Text(
+                        if (p60.sizeLowered)
+                            "60 fps: will record at ${p60.width}×${p60.height} (lowered from ${p60.presetWidth}×${p60.presetHeight}; largest size this encoder allows at 60 fps)."
+                        else
+                            "60 fps: will record at ${p60.width}×${p60.height}.",
+                        fontSize = 12.sp, color = Color(0xFF9A9CA6),
+                    )
+                    else Text(
+                        "60 fps isn't possible on this encoder; using ${p60.fps} fps at ${p60.width}×${p60.height}.",
+                        fontSize = 12.sp, color = Color(0xFFFFB74D),
+                    )
+                } else if (!fps60.first) Text(
+                    "60 fps isn't supported by this phone's hardware encoder (up to ${fps60.second ?: 30} fps at this size).",
                     fontSize = 12.sp, color = Color(0xFFFFB74D),
                 )
             }

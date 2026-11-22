@@ -55,8 +55,19 @@ object CodecSupport {
         val maxFps: Double? = null, // what the encoder itself reports for this exact size
         val alignment: Int = 16,
         val bitrateMode: Int = MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR,
+        /** Aligned size of the chosen resolution preset, before any fps-driven shrink. */
+        val presetWidth: Int = width,
+        val presetHeight: Int = height,
+        /** Largest 16-aligned native-aspect size the encoder reports as supporting the requested fps. */
+        val capsMaxWidth: Int? = null,
+        val capsMaxHeight: Int? = null,
+        val supportedRates: String? = null,
+        val achievableRates: String? = null,
+        /** Detailed fps/size probe lines for the diagnostic log (not shown in the UI). */
+        val searchLog: List<String> = emptyList(),
     ) {
         val hardware get() = codecName != null
+        val sizeLowered get() = width != presetWidth || height != presetHeight
     }
 
     private fun align(v: Double, a: Int): Int = max(a, (v / a).roundToInt() * a)
@@ -80,6 +91,7 @@ object CodecSupport {
     fun plan(ctx: Context, s: RecSettings): Plan {
         val nd = nativeDisplay(ctx)
         val notes = ArrayList<String>()
+        val searchLog = ArrayList<String>()
         var codec = s.codec
         var info = findHardwareEncoder(codec.mime)
         if (info == null && codec == Codec.HEVC) {
@@ -93,7 +105,6 @@ object CodecSupport {
         val (l, sh) = outputSize(s.res, nd.long, nd.short)
         val outW = if (landscape) l else sh
         val outH = if (landscape) sh else l
-        val aspect = outW / outH
 
         val reqFps = s.fps
         var bitrate = s.bitrateMbps * 1_000_000
@@ -103,7 +114,22 @@ object CodecSupport {
         val firstW = align(outW, a)
         val firstH = align(outH, a)
 
-        if (caps == null) return Plan(info?.name, codec.mime, firstW, firstH, nd.dpi, reqFps, bitrate, notes, alignment = a)
+        fun planOf(
+            w: Int,
+            h: Int,
+            fps: Int,
+            maxFps: Double? = null,
+            mode: Int = MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR,
+            capsW: Int? = null,
+            capsH: Int? = null,
+            supported: String? = null,
+            achievable: String? = null,
+        ) = Plan(
+            info?.name, codec.mime, w, h, nd.dpi, fps, bitrate, notes, maxFps, a, mode,
+            firstW, firstH, capsW, capsH, supported, achievable, searchLog,
+        )
+
+        if (caps == null) return planOf(firstW, firstH, reqFps)
 
         bitrate = bitrate.coerceIn(caps.bitrateRange.lower, caps.bitrateRange.upper)
         // CBR honours the selected bitrate far better than VBR (VBR undershot: 16 Mbps selected -> 11 actual).
@@ -111,39 +137,122 @@ object CodecSupport {
         val mode = if (enc != null && enc.isBitrateModeSupported(MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR))
             MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR else MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR
         fun rateAt(w: Int, h: Int): Double? = runCatching { caps.getSupportedFrameRatesFor(w, h).upper }.getOrNull()
+        fun ratesAt(w: Int, h: Int): String = runCatching { caps.getSupportedFrameRatesFor(w, h).toString() }.getOrElse { "n/a ($it)" }
+        fun achievableAt(w: Int, h: Int): String = runCatching { caps.getAchievableFrameRatesFor(w, h)?.toString() }.getOrNull() ?: "n/a"
         fun fpsOk(w: Int, h: Int, f: Int) = caps.areSizeAndRateSupported(w, h, f.toDouble())
 
-        // Candidates: the ideal aligned size first, then slightly narrower 16-aligned sizes with nearly the same aspect.
-        val candidates = ArrayList<Pair<Int, Int>>()
-        candidates += firstW to firstH
-        var w = firstW - a
-        while (w >= firstW * 0.85) {
-            candidates += w to align(w / aspect, a)
-            w -= a
+        val nativeAspect = nd.long.toDouble() / nd.short // long/short, e.g. 2408/1080
+
+        /** Short-edge candidates for a 16-aligned long edge, staying close to the native aspect. */
+        fun shortsFor(longEdge: Int): List<Int> {
+            val ideal = longEdge / nativeAspect
+            val mid = align(ideal, a)
+            return listOf(mid, mid - a, mid + a).filter { it >= a }.distinct()
         }
-        val supported = candidates.filter { (cw, ch) -> caps.isSizeSupported(cw, ch) }
-        val withRate = supported.firstOrNull { (cw, ch) -> fpsOk(cw, ch, reqFps) }
+
+        fun orient(longEdge: Int, shortEdge: Int): Pair<Int, Int> =
+            if (landscape) longEdge to shortEdge else shortEdge to longEdge
+
+        /**
+         * Largest 16-aligned size at the screen's native aspect for which the encoder declares [fps].
+         * Walks the long edge down from [startLong], trying nearby short-edge alignments.
+         */
+        fun largestForFps(startLong: Int, fps: Int, logProbes: Boolean): Pair<Int, Int>? {
+            val minW = max(a, caps.supportedWidths.lower)
+            val minH = max(a, caps.supportedHeights.lower)
+            val minLong = if (landscape) minW else minH
+            var longEdge = startLong
+            var probed = 0
+            while (longEdge >= minLong) {
+                var best: Pair<Int, Int>? = null
+                for (shortEdge in shortsFor(longEdge)) {
+                    val (cw, ch) = orient(longEdge, shortEdge)
+                    if (cw < minW || ch < minH) continue
+                    val sizeOk = caps.isSizeSupported(cw, ch)
+                    val ok = sizeOk && fpsOk(cw, ch, fps)
+                    if (logProbes && (sizeOk || longEdge == startLong)) {
+                        searchLog += "  ${cw}x$ch size=$sizeOk rates=${if (sizeOk) ratesAt(cw, ch) else "n/a"} " +
+                            "achievable=${if (sizeOk) achievableAt(cw, ch) else "n/a"} " +
+                            "areSizeAndRateSupported($fps)=$ok"
+                        probed++
+                    }
+                    if (ok && (best == null || cw * ch > best.first * best.second)) best = cw to ch
+                }
+                if (best != null) {
+                    if (logProbes) searchLog += "  -> chosen ${best.first}x${best.second} after $probed size-supported probes"
+                    return best
+                }
+                longEdge -= a
+            }
+            if (logProbes) searchLog += "  -> no size declared $fps fps (probed $probed sizes from long-edge $startLong down to $minLong)"
+            return null
+        }
+
+        val startLong = max(firstW, firstH)
+        searchLog += "preset ${firstW}x$firstH (aligned ${a}px) requested $reqFps fps, native ${nd.long}x${nd.short} aspect, " +
+            (if (landscape) "landscape" else "portrait")
+        searchLog += "  preset rates=${ratesAt(firstW, firstH)} achievable=${achievableAt(firstW, firstH)} " +
+            "areSizeAndRateSupported($reqFps)=${fpsOk(firstW, firstH, reqFps)}"
 
         val chosen: Pair<Int, Int>
         var fps = reqFps
-        if (withRate != null) {
-            chosen = withRate
-            if (chosen != candidates[0]) notes += "${candidates[0].first}x${candidates[0].second} can't do $reqFps fps on this encoder; using ${chosen.first}x${chosen.second} to keep $reqFps fps."
-        } else if (supported.isNotEmpty()) {
-            // Never go above what the encoder declares: clamp to the best supported rate <= requested.
-            chosen = supported[0]
-            val limit = rateAt(chosen.first, chosen.second)?.toInt()
-            fps = listOf(60, 30, 24, 15).firstOrNull { it <= reqFps && fpsOk(chosen.first, chosen.second, it) }
-                ?: min(reqFps, max(1, limit ?: 15))
-            notes += "Encoder supports up to ${limit ?: "?"} fps at ${chosen.first}x${chosen.second}; using $fps fps."
+        var capsMax: Pair<Int, Int>? = null
+
+        if (reqFps > 30) {
+            // Prefer keeping the requested fps, shrinking resolution as needed (used for 60 fps mode).
+            searchLog += "searching largest native-aspect ${a}px-aligned size with areSizeAndRateSupported($reqFps)=true:"
+            capsMax = largestForFps(startLong, reqFps, logProbes = true)
+            if (capsMax != null) {
+                chosen = capsMax
+                if (chosen != firstW to firstH) {
+                    notes += "To keep $reqFps fps, resolution is lowered from ${firstW}x$firstH to ${chosen.first}x${chosen.second} (largest size this encoder supports at $reqFps fps, native aspect, ${a}px aligned)."
+                }
+            } else {
+                // Nothing at the requested fps: fall back to the preset size and clamp fps (old behaviour).
+                chosen = firstW to firstH
+                val limit = rateAt(chosen.first, chosen.second)?.toInt()
+                fps = listOf(60, 30, 24, 15).firstOrNull { it <= reqFps && fpsOk(chosen.first, chosen.second, it) }
+                    ?: min(reqFps, max(1, limit ?: 15))
+                notes += "Encoder has no ${a}px-aligned native-aspect size for $reqFps fps; using $fps fps at ${chosen.first}x${chosen.second} (up to ${limit ?: "?"} fps)."
+            }
         } else {
-            chosen = candidates[0]
-            notes += "Encoder reports ${candidates[0].first}x${candidates[0].second} unsupported; trying anyway."
+            // 30 fps and below: keep the selected preset. Only nudge size within 15% if the exact size is rejected.
+            val aspect = outW / outH
+            val candidates = ArrayList<Pair<Int, Int>>()
+            candidates += firstW to firstH
+            var w = firstW - a
+            while (w >= firstW * 0.85) {
+                candidates += w to align(w / aspect, a)
+                w -= a
+            }
+            val supported = candidates.filter { (cw, ch) -> caps.isSizeSupported(cw, ch) }
+            val withRate = supported.firstOrNull { (cw, ch) -> fpsOk(cw, ch, reqFps) }
+            if (withRate != null) {
+                chosen = withRate
+                if (chosen != candidates[0]) notes += "${candidates[0].first}x${candidates[0].second} can't do $reqFps fps on this encoder; using ${chosen.first}x${chosen.second} to keep $reqFps fps."
+            } else if (supported.isNotEmpty()) {
+                chosen = supported[0]
+                val limit = rateAt(chosen.first, chosen.second)?.toInt()
+                fps = listOf(60, 30, 24, 15).firstOrNull { it <= reqFps && fpsOk(chosen.first, chosen.second, it) }
+                    ?: min(reqFps, max(1, limit ?: 15))
+                notes += "Encoder supports up to ${limit ?: "?"} fps at ${chosen.first}x${chosen.second}; using $fps fps."
+            } else {
+                chosen = candidates[0]
+                notes += "Encoder reports ${candidates[0].first}x${candidates[0].second} unsupported; trying anyway."
+            }
+            // Still compute the caps-derived max for the requested rate (useful in logs even at 30 fps).
+            capsMax = if (fpsOk(chosen.first, chosen.second, reqFps)) chosen else largestForFps(startLong, reqFps, logProbes = false)
         }
-        return Plan(info.name, codec.mime, chosen.first, chosen.second, nd.dpi, fps, bitrate, notes, rateAt(chosen.first, chosen.second), a, mode)
+
+        val cw = chosen.first
+        val ch = chosen.second
+        return planOf(
+            cw, ch, fps, rateAt(cw, ch), mode,
+            capsMax?.first, capsMax?.second, ratesAt(cw, ch), achievableAt(cw, ch),
+        )
     }
 
-    /** True if the encoder declares support for 60 fps at the 1080p-class size of [s] (used to enable the 60 fps chip). */
+    /** True if the encoder declares support for 60 fps at some native-aspect size (used to enable the 60 fps chip). */
     fun supports60(ctx: Context, s: RecSettings): Pair<Boolean, Int?> {
         val p = plan(ctx, s.copy(fps = 60))
         return (p.fps >= 60) to p.maxFps?.toInt()

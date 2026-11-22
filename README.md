@@ -13,8 +13,11 @@ Not for the Play Store. No internet permission.
 - Encoding, muxing and audio each run on their own threads; the UI is closed while recording.
 
 ## Defaults
-1080p (1920 px wide, native aspect, about 1920x864 here) · 60 fps · 12 Mbps · H.264 · landscape · mic off · bubble off.
-Other options: Native 2408x1080, 720p, 30 fps, 8/16 Mbps, H.265 (only if a hardware encoder exists).
+1080p (1920 px wide, native aspect, about 1920x864 here) · 30 fps · 12 Mbps · H.264 · landscape · mic off · bubble off.
+Other options: Native 2408x1080, 720p, 60 fps, 8/16 Mbps, H.265 (only if a hardware encoder exists).
+At 60 fps the app picks the largest 16-aligned size at the screen's native aspect that this phone's hardware encoder
+declares as supporting 60 fps (expected around 1520x688 on the Unisoc T820, computed from encoder caps at runtime)
+and shows that size before you start.
 
 ## Output
 `Movies/NyteRecorder/NyteRec_yyyyMMdd_HHmmss.mp4`. Stop from the notification, the app, or the optional bubble.

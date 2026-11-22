@@ -225,6 +225,12 @@ class RecordingEngine(
         notes += p.notes
         p.notes.forEach { log.line("plan note: $it") }
         log.line("plan: ${p.width}x${p.height} @${p.fps}fps ${p.bitrate / 1000}kbps mime=${p.mime} encoder=${p.codecName ?: "NONE(system default)"} dpi=${p.dpi} reportedMaxFps=${p.maxFps} bitrateMode=${modeName(p.bitrateMode)} align=${p.alignment}")
+        log.raw("  preset size ${p.presetWidth}x${p.presetHeight}; caps-derived max for ${settings.fps} fps: ${p.capsMaxWidth?.let { "${it}x${p.capsMaxHeight}" } ?: "none"}")
+        log.raw("  supportedFrameRatesFor(chosen)=${p.supportedRates ?: "n/a"} achievableFrameRatesFor(chosen)=${p.achievableRates ?: "n/a"}")
+        if (p.searchLog.isNotEmpty()) {
+            log.raw("  fps/size search:")
+            p.searchLog.forEach { log.raw("  $it") }
+        }
         log.raw("  hardware ${p.mime} encoders on device: " + CodecSupport.listEncoders(p.mime).joinToString(" | "))
         p.codecName?.let { n ->
             MediaCodecList_find(n)?.let { info -> CodecSupport.describe(info, p.mime, p.width, p.height).forEach { log.raw("  $it") } }
@@ -745,7 +751,11 @@ class RecordingEngine(
         sum.raw("Thermal/battery at start: ${batteryStart.ifEmpty { "n/a" }}")
         sum.raw("Thermal/battery at end:   $endState")
         sum.raw("Max battery temp seen: ${if (maxBatteryC.isNaN()) "n/a" else "%.1f C".format(Locale.US, maxBatteryC)}")
-        if (p != null) sum.raw("Selected: ${p.width}x${p.height} @${p.fps}fps (effective encoder fps $effFps) ${p.bitrate / 1000} kbps ${p.mime}, encoder=${p.codecName ?: "default"}")
+        if (p != null) {
+            sum.raw("Selected: ${p.width}x${p.height} @${p.fps}fps (effective encoder fps $effFps) ${p.bitrate / 1000} kbps ${p.mime}, encoder=${p.codecName ?: "default"}")
+            sum.raw("Size plan: preset ${p.presetWidth}x${p.presetHeight}; caps-derived max for ${settings.fps} fps: ${p.capsMaxWidth?.let { "${it}x${p.capsMaxHeight}" } ?: "none"}; chosen ${p.width}x${p.height}")
+            sum.raw("Encoder rates at chosen size: supported=${p.supportedRates ?: "n/a"} achievable=${p.achievableRates ?: "n/a"} reportedMaxFps=${p.maxFps}")
+        }
 
         sum.section("VIDEO (encoder output, measured in-process)")
         val v = vs
@@ -876,7 +886,7 @@ class RecordingEngine(
                 }
                 if (audioWanted && audioDesc == null) problems += "no audio track"
                 out.raw("Selected vs actual:")
-                out.raw("  size:    selected ${p.width}x${p.height}, actual ${w}x$h -> ${if (sizeOk) "OK" else "MISMATCH"}")
+                out.raw("  size:    selected ${p.width}x${p.height} (preset ${p.presetWidth}x${p.presetHeight}, caps max for ${p.fps} fps ${p.capsMaxWidth?.let { "${it}x${p.capsMaxHeight}" } ?: "n/a"}), actual ${w}x$h -> ${if (sizeOk) "OK" else "MISMATCH"}")
                 out.raw("  fps:     selected $effFps, actual average ${"%.2f".format(Locale.US, videoFps)} -> ${if (fpsOk) "OK" else "BELOW TARGET"}")
                 out.raw("  bitrate: selected video ${p.bitrate / 1000} kbps ($usedMode), actual video ${"%.0f".format(Locale.US, videoKbps)} kbps -> ${if (!brOk) "OFF TARGET" else if (info.isNotEmpty()) "OK (VBR undershoot, informational)" else "OK"}")
                 out.raw("  audio:   ${audioDesc ?: "none"} (wanted=$audioWanted)")

@@ -14,7 +14,7 @@ android {
         targetSdk = 34
         // versionCode follows the CI run number (always increasing); local fallback 2.
         versionCode = System.getenv("GITHUB_RUN_NUMBER")?.toIntOrNull() ?: 2
-        versionName = "1.1"
+        versionName = "1.2"
     }
 
     buildTypes {
